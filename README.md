@@ -251,4 +251,4 @@ FlashKV is designed to explore:
 
 ## Status
 
-FlashKV is currently an educational Redis-compatible database under active development. To demonstrate System Design knowledge of Redis
+FlashKV is currently an educational Redis-compatible database under active development.
