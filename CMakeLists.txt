@@ -29,6 +29,7 @@ add_executable(
     flashkv_server
     src/tcp_server.cpp
     src/database.cpp
+    src/resp.cpp
 )
 
 target_include_directories(
