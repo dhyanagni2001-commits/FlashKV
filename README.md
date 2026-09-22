@@ -227,7 +227,7 @@ Expected raw response:
 - [x] Persistent TCP connections
 - [x] RESP2 parsing and encoding
 - [x] `redis-cli` compatibility
-- [ ] `EXPIRE` and `TTL`
+- [x] `EXPIRE` and `TTL`
 - [ ] Active expiration cleanup
 - [ ] Append-only file persistence
 - [ ] Non-blocking event loop
