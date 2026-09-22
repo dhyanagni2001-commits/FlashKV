@@ -2,14 +2,33 @@
 #include "resp.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <csignal>
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
+#include <system_error>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+
+bool parseIntegerArgument(
+    const std::string& text,
+    long long& value
+) {
+    const char* begin = text.data();
+    const char* end = text.data() + text.size();
+
+    auto result = std::from_chars(
+        begin,
+        end,
+        value
+    );
+
+    return result.ec == std::errc{} &&
+           result.ptr == end;
+}
 
 std::string executeCommand(
     Database& database,
@@ -32,6 +51,10 @@ std::string executeCommand(
         }
     );
 
+    /*
+     * PING
+     * PING message
+     */
     if (command == "PING") {
         if (arguments.size() == 1) {
             return respSimpleString("PONG");
@@ -46,6 +69,9 @@ std::string executeCommand(
         );
     }
 
+    /*
+     * ECHO message
+     */
     if (command == "ECHO") {
         if (arguments.size() != 2) {
             return respError(
@@ -56,6 +82,9 @@ std::string executeCommand(
         return respBulkString(arguments[1]);
     }
 
+    /*
+     * SET key value
+     */
     if (command == "SET") {
         if (arguments.size() != 3) {
             return respError(
@@ -63,10 +92,17 @@ std::string executeCommand(
             );
         }
 
-        database.set(arguments[1], arguments[2]);
+        database.set(
+            arguments[1],
+            arguments[2]
+        );
+
         return respSimpleString("OK");
     }
 
+    /*
+     * GET key
+     */
     if (command == "GET") {
         if (arguments.size() != 2) {
             return respError(
@@ -83,6 +119,9 @@ std::string executeCommand(
         return respBulkString(value.value());
     }
 
+    /*
+     * DEL key [key ...]
+     */
     if (command == "DEL") {
         if (arguments.size() < 2) {
             return respError(
@@ -92,9 +131,11 @@ std::string executeCommand(
 
         long long deletedCount = 0;
 
-        for (std::size_t index = 1;
-             index < arguments.size();
-             ++index) {
+        for (
+            std::size_t index = 1;
+            index < arguments.size();
+            ++index
+        ) {
             if (database.del(arguments[index])) {
                 ++deletedCount;
             }
@@ -103,6 +144,9 @@ std::string executeCommand(
         return respInteger(deletedCount);
     }
 
+    /*
+     * EXISTS key [key ...]
+     */
     if (command == "EXISTS") {
         if (arguments.size() < 2) {
             return respError(
@@ -112,9 +156,11 @@ std::string executeCommand(
 
         long long existingCount = 0;
 
-        for (std::size_t index = 1;
-             index < arguments.size();
-             ++index) {
+        for (
+            std::size_t index = 1;
+            index < arguments.size();
+            ++index
+        ) {
             if (database.exists(arguments[index])) {
                 ++existingCount;
             }
@@ -123,8 +169,63 @@ std::string executeCommand(
         return respInteger(existingCount);
     }
 
+    /*
+     * EXPIRE key seconds
+     */
+    if (command == "EXPIRE") {
+        if (arguments.size() != 3) {
+            return respError(
+                "wrong number of arguments for 'EXPIRE'"
+            );
+        }
+
+        long long seconds = 0;
+
+        if (
+            !parseIntegerArgument(
+                arguments[2],
+                seconds
+            )
+        ) {
+            return respError(
+                "value is not an integer or out of range"
+            );
+        }
+
+        bool expirationAdded = database.expire(
+            arguments[1],
+            seconds
+        );
+
+        return respInteger(
+            expirationAdded ? 1 : 0
+        );
+    }
+
+    /*
+     * TTL key
+     *
+     * Returns:
+     *  -2 when the key does not exist
+     *  -1 when the key has no expiration
+     *   0 or greater for remaining seconds
+     */
+    if (command == "TTL") {
+        if (arguments.size() != 2) {
+            return respError(
+                "wrong number of arguments for 'TTL'"
+            );
+        }
+
+        return respInteger(
+            database.ttl(arguments[1])
+        );
+    }
+
     return respError(
-        "unknown command '" + arguments[0] + "'"
+        "unknown command '" +
+        arguments[0] +
+        "'"
     );
 }
 
@@ -146,7 +247,8 @@ bool sendAll(
             return false;
         }
 
-        totalSent += static_cast<std::size_t>(bytesSent);
+        totalSent +=
+            static_cast<std::size_t>(bytesSent);
     }
 
     return true;
@@ -173,9 +275,15 @@ void handleClient(
 
         pendingData.append(
             buffer,
-            static_cast<std::size_t>(bytesReceived)
+            static_cast<std::size_t>(
+                bytesReceived
+            )
         );
 
+        /*
+         * Process all complete RESP commands currently
+         * available in the connection's input buffer.
+         */
         while (true) {
             RespParseResult result =
                 parseRespCommand(pendingData);
@@ -184,6 +292,7 @@ void handleClient(
                 result.status ==
                 RespParseStatus::Incomplete
             ) {
+                // Wait for the remaining TCP data.
                 break;
             }
 
@@ -211,7 +320,12 @@ void handleClient(
                     result.arguments
                 );
 
-            if (!sendAll(clientSocket, response)) {
+            if (
+                !sendAll(
+                    clientSocket,
+                    response
+                )
+            ) {
                 close(clientSocket);
                 return;
             }
@@ -225,10 +339,17 @@ int main() {
     constexpr int PORT = 6379;
     constexpr int CONNECTION_BACKLOG = 10;
 
-    // Prevent the process from terminating if a client
-    // disconnects while a response is being sent.
+    /*
+     * Prevent FlashKV from terminating if a client
+     * disconnects while a response is being sent.
+     */
     std::signal(SIGPIPE, SIG_IGN);
 
+    /*
+     * The database is created outside the connection loop.
+     * Therefore, data remains available when one client
+     * disconnects and another client connects.
+     */
     Database database;
 
     int serverSocket = socket(
@@ -238,10 +359,16 @@ int main() {
     );
 
     if (serverSocket == -1) {
-        std::cerr << "Failed to create socket\n";
+        std::cerr
+            << "Failed to create socket\n";
+
         return 1;
     }
 
+    /*
+     * Allow the port to be reused immediately after
+     * restarting FlashKV.
+     */
     int option = 1;
 
     if (
@@ -253,12 +380,15 @@ int main() {
             sizeof(option)
         ) == -1
     ) {
-        std::cerr << "Failed to configure socket\n";
+        std::cerr
+            << "Failed to configure socket\n";
+
         close(serverSocket);
         return 1;
     }
 
     sockaddr_in serverAddress{};
+
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(PORT);
     serverAddress.sin_addr.s_addr =
@@ -302,6 +432,7 @@ int main() {
 
     while (true) {
         sockaddr_in clientAddress{};
+
         socklen_t clientSize =
             sizeof(clientAddress);
 
@@ -316,12 +447,21 @@ int main() {
         if (clientSocket == -1) {
             std::cerr
                 << "Failed to accept connection\n";
+
             continue;
         }
 
         std::cout << "Client connected\n";
 
-        handleClient(clientSocket, database);
+        /*
+         * This currently blocks until the connected client
+         * disconnects. A non-blocking event loop will replace
+         * this behavior later.
+         */
+        handleClient(
+            clientSocket,
+            database
+        );
 
         std::cout << "Client disconnected\n";
     }
