@@ -1,8 +1,10 @@
+#include "aof.hpp"
 #include "database.hpp"
 #include "resp.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <csignal>
 #include <iostream>
@@ -30,8 +32,18 @@ bool parseIntegerArgument(
            result.ptr == end;
 }
 
+long long currentUnixSeconds() {
+    return std::chrono::duration_cast<
+        std::chrono::seconds
+    >(
+        std::chrono::system_clock::now()
+            .time_since_epoch()
+    ).count();
+}
+
 std::string executeCommand(
     Database& database,
+    AppendOnlyFile& aof,
     const std::vector<std::string>& arguments
 ) {
     if (arguments.empty()) {
@@ -92,6 +104,15 @@ std::string executeCommand(
             );
         }
 
+        /*
+         * Persist the command before changing memory.
+         */
+        if (!aof.append(arguments)) {
+            return respError(
+                "failed to persist SET command"
+            );
+        }
+
         database.set(
             arguments[1],
             arguments[2]
@@ -126,6 +147,15 @@ std::string executeCommand(
         if (arguments.size() < 2) {
             return respError(
                 "wrong number of arguments for 'DEL'"
+            );
+        }
+
+        /*
+         * Save the complete DEL command before applying it.
+         */
+        if (!aof.append(arguments)) {
+            return respError(
+                "failed to persist DEL command"
             );
         }
 
@@ -192,14 +222,61 @@ std::string executeCommand(
             );
         }
 
-        bool expirationAdded = database.expire(
+        /*
+         * Redis returns 0 when the key does not exist.
+         */
+        if (!database.exists(arguments[1])) {
+            return respInteger(0);
+        }
+
+        /*
+         * An expiration of zero or less deletes the key
+         * immediately.
+         */
+        if (seconds <= 0) {
+            std::vector<std::string> deleteCommand{
+                "DEL",
+                arguments[1]
+            };
+
+            if (!aof.append(deleteCommand)) {
+                return respError(
+                    "failed to persist expiration"
+                );
+            }
+
+            database.del(arguments[1]);
+
+            return respInteger(1);
+        }
+
+        /*
+         * Save an absolute expiration time in the AOF.
+         *
+         * If we saved only "EXPIRE key 60", restarting the
+         * server would incorrectly reset the TTL to 60.
+         */
+        const long long expirationTime =
+            currentUnixSeconds() + seconds;
+
+        std::vector<std::string> expireAtCommand{
+            "EXPIREAT",
+            arguments[1],
+            std::to_string(expirationTime)
+        };
+
+        if (!aof.append(expireAtCommand)) {
+            return respError(
+                "failed to persist EXPIRE command"
+            );
+        }
+
+        database.expire(
             arguments[1],
             seconds
         );
 
-        return respInteger(
-            expirationAdded ? 1 : 0
-        );
+        return respInteger(1);
     }
 
     /*
@@ -256,7 +333,8 @@ bool sendAll(
 
 void handleClient(
     int clientSocket,
-    Database& database
+    Database& database,
+    AppendOnlyFile& aof
 ) {
     std::string pendingData;
     char buffer[4096];
@@ -281,8 +359,8 @@ void handleClient(
         );
 
         /*
-         * Process all complete RESP commands currently
-         * available in the connection's input buffer.
+         * Process every complete RESP command currently
+         * available in the connection buffer.
          */
         while (true) {
             RespParseResult result =
@@ -292,7 +370,6 @@ void handleClient(
                 result.status ==
                 RespParseStatus::Incomplete
             ) {
-                // Wait for the remaining TCP data.
                 break;
             }
 
@@ -317,6 +394,7 @@ void handleClient(
             std::string response =
                 executeCommand(
                     database,
+                    aof,
                     result.arguments
                 );
 
@@ -340,17 +418,29 @@ int main() {
     constexpr int CONNECTION_BACKLOG = 10;
 
     /*
-     * Prevent FlashKV from terminating if a client
+     * Prevent the process from terminating when a client
      * disconnects while a response is being sent.
      */
     std::signal(SIGPIPE, SIG_IGN);
 
-    /*
-     * The database is created outside the connection loop.
-     * Therefore, data remains available when one client
-     * disconnects and another client connects.
-     */
     Database database;
+
+    /*
+     * Commands that modify data are stored here.
+     */
+    AppendOnlyFile aof("flashkv.aof");
+
+    /*
+     * Rebuild the in-memory database from the AOF.
+     */
+    if (!aof.load(database)) {
+        std::cerr
+            << "Failed to load flashkv.aof\n";
+
+        return 1;
+    }
+
+    std::cout << "AOF data loaded\n";
 
     int serverSocket = socket(
         AF_INET,
@@ -365,10 +455,6 @@ int main() {
         return 1;
     }
 
-    /*
-     * Allow the port to be reused immediately after
-     * restarting FlashKV.
-     */
     int option = 1;
 
     if (
@@ -453,14 +539,10 @@ int main() {
 
         std::cout << "Client connected\n";
 
-        /*
-         * This currently blocks until the connected client
-         * disconnects. A non-blocking event loop will replace
-         * this behavior later.
-         */
         handleClient(
             clientSocket,
-            database
+            database,
+            aof
         );
 
         std::cout << "Client disconnected\n";

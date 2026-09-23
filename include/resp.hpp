@@ -25,3 +25,6 @@ std::string respError(const std::string& message);
 std::string respInteger(long long value);
 std::string respBulkString(const std::string& value);
 std::string respNull();
+std::string respArray(
+    const std::vector<std::string>& arguments
+);

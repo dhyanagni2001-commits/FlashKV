@@ -196,3 +196,16 @@ std::string respBulkString(
 std::string respNull() {
     return "$-1\r\n";
 }
+
+std::string respArray(
+    const std::vector<std::string>& arguments
+) {
+    std::string encoded =
+        "*" + std::to_string(arguments.size()) + "\r\n";
+
+    for (const std::string& argument : arguments) {
+        encoded += respBulkString(argument);
+    }
+
+    return encoded;
+}
