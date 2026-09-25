@@ -3,16 +3,19 @@
 #include "resp.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cctype>
 #include <csignal>
 #include <iostream>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string>
 #include <system_error>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 bool parseIntegerArgument(
@@ -63,10 +66,6 @@ std::string executeCommand(
         }
     );
 
-    /*
-     * PING
-     * PING message
-     */
     if (command == "PING") {
         if (arguments.size() == 1) {
             return respSimpleString("PONG");
@@ -81,9 +80,6 @@ std::string executeCommand(
         );
     }
 
-    /*
-     * ECHO message
-     */
     if (command == "ECHO") {
         if (arguments.size() != 2) {
             return respError(
@@ -94,9 +90,6 @@ std::string executeCommand(
         return respBulkString(arguments[1]);
     }
 
-    /*
-     * SET key value
-     */
     if (command == "SET") {
         if (arguments.size() != 3) {
             return respError(
@@ -104,9 +97,6 @@ std::string executeCommand(
             );
         }
 
-        /*
-         * Persist the command before changing memory.
-         */
         if (!aof.append(arguments)) {
             return respError(
                 "failed to persist SET command"
@@ -121,9 +111,6 @@ std::string executeCommand(
         return respSimpleString("OK");
     }
 
-    /*
-     * GET key
-     */
     if (command == "GET") {
         if (arguments.size() != 2) {
             return respError(
@@ -140,9 +127,6 @@ std::string executeCommand(
         return respBulkString(value.value());
     }
 
-    /*
-     * DEL key [key ...]
-     */
     if (command == "DEL") {
         if (arguments.size() < 2) {
             return respError(
@@ -150,9 +134,6 @@ std::string executeCommand(
             );
         }
 
-        /*
-         * Save the complete DEL command before applying it.
-         */
         if (!aof.append(arguments)) {
             return respError(
                 "failed to persist DEL command"
@@ -174,9 +155,6 @@ std::string executeCommand(
         return respInteger(deletedCount);
     }
 
-    /*
-     * EXISTS key [key ...]
-     */
     if (command == "EXISTS") {
         if (arguments.size() < 2) {
             return respError(
@@ -199,9 +177,6 @@ std::string executeCommand(
         return respInteger(existingCount);
     }
 
-    /*
-     * EXPIRE key seconds
-     */
     if (command == "EXPIRE") {
         if (arguments.size() != 3) {
             return respError(
@@ -222,17 +197,10 @@ std::string executeCommand(
             );
         }
 
-        /*
-         * Redis returns 0 when the key does not exist.
-         */
         if (!database.exists(arguments[1])) {
             return respInteger(0);
         }
 
-        /*
-         * An expiration of zero or less deletes the key
-         * immediately.
-         */
         if (seconds <= 0) {
             std::vector<std::string> deleteCommand{
                 "DEL",
@@ -246,16 +214,9 @@ std::string executeCommand(
             }
 
             database.del(arguments[1]);
-
             return respInteger(1);
         }
 
-        /*
-         * Save an absolute expiration time in the AOF.
-         *
-         * If we saved only "EXPIRE key 60", restarting the
-         * server would incorrectly reset the TTL to 60.
-         */
         const long long expirationTime =
             currentUnixSeconds() + seconds;
 
@@ -279,14 +240,6 @@ std::string executeCommand(
         return respInteger(1);
     }
 
-    /*
-     * TTL key
-     *
-     * Returns:
-     *  -2 when the key does not exist
-     *  -1 when the key has no expiration
-     *   0 or greater for remaining seconds
-     */
     if (command == "TTL") {
         if (arguments.size() != 2) {
             return respError(
@@ -320,6 +273,10 @@ bool sendAll(
             0
         );
 
+        if (bytesSent < 0 && errno == EINTR) {
+            continue;
+        }
+
         if (bytesSent <= 0) {
             return false;
         }
@@ -331,108 +288,96 @@ bool sendAll(
     return true;
 }
 
-void handleClient(
+bool processClientData(
     int clientSocket,
+    std::string& pendingData,
     Database& database,
     AppendOnlyFile& aof
 ) {
-    std::string pendingData;
     char buffer[4096];
 
-    while (true) {
-        ssize_t bytesReceived = recv(
+    ssize_t bytesReceived;
+
+    do {
+        bytesReceived = recv(
             clientSocket,
             buffer,
             sizeof(buffer),
             0
         );
+    } while (
+        bytesReceived < 0 &&
+        errno == EINTR
+    );
 
-        if (bytesReceived <= 0) {
+    if (bytesReceived <= 0) {
+        return false;
+    }
+
+    pendingData.append(
+        buffer,
+        static_cast<std::size_t>(
+            bytesReceived
+        )
+    );
+
+    while (true) {
+        RespParseResult result =
+            parseRespCommand(pendingData);
+
+        if (
+            result.status ==
+            RespParseStatus::Incomplete
+        ) {
             break;
         }
 
-        pendingData.append(
-            buffer,
-            static_cast<std::size_t>(
-                bytesReceived
-            )
-        );
-
-        /*
-         * Process every complete RESP command currently
-         * available in the connection buffer.
-         */
-        while (true) {
-            RespParseResult result =
-                parseRespCommand(pendingData);
-
-            if (
-                result.status ==
-                RespParseStatus::Incomplete
-            ) {
-                break;
-            }
-
-            if (
-                result.status ==
-                RespParseStatus::Error
-            ) {
-                sendAll(
-                    clientSocket,
-                    respError(result.error)
-                );
-
-                close(clientSocket);
-                return;
-            }
-
-            pendingData.erase(
-                0,
-                result.consumedBytes
+        if (
+            result.status ==
+            RespParseStatus::Error
+        ) {
+            sendAll(
+                clientSocket,
+                respError(result.error)
             );
 
-            std::string response =
-                executeCommand(
-                    database,
-                    aof,
-                    result.arguments
-                );
+            return false;
+        }
 
-            if (
-                !sendAll(
-                    clientSocket,
-                    response
-                )
-            ) {
-                close(clientSocket);
-                return;
-            }
+        pendingData.erase(
+            0,
+            result.consumedBytes
+        );
+
+        std::string response =
+            executeCommand(
+                database,
+                aof,
+                result.arguments
+            );
+
+        if (
+            !sendAll(
+                clientSocket,
+                response
+            )
+        ) {
+            return false;
         }
     }
 
-    close(clientSocket);
+    return true;
 }
 
 int main() {
     constexpr int PORT = 6379;
-    constexpr int CONNECTION_BACKLOG = 10;
+    constexpr int CONNECTION_BACKLOG = 128;
 
-    /*
-     * Prevent the process from terminating when a client
-     * disconnects while a response is being sent.
-     */
     std::signal(SIGPIPE, SIG_IGN);
 
     Database database;
-
-    /*
-     * Commands that modify data are stored here.
-     */
     AppendOnlyFile aof("flashkv.aof");
 
-    /*
-     * Rebuild the in-memory database from the AOF.
-     */
     if (!aof.load(database)) {
         std::cerr
             << "Failed to load flashkv.aof\n";
@@ -505,7 +450,7 @@ int main() {
         ) == -1
     ) {
         std::cerr
-            << "Failed to listen for connections\n";
+            << "Failed to listen\n";
 
         close(serverSocket);
         return 1;
@@ -516,36 +461,154 @@ int main() {
         << PORT
         << '\n';
 
-    while (true) {
-        sockaddr_in clientAddress{};
+    /*
+     * Index 0 always contains the listening socket.
+     * The remaining entries represent connected clients.
+     */
+    std::vector<pollfd> sockets;
 
-        socklen_t clientSize =
-            sizeof(clientAddress);
-
-        int clientSocket = accept(
+    sockets.push_back(
+        pollfd{
             serverSocket,
-            reinterpret_cast<sockaddr*>(
-                &clientAddress
-            ),
-            &clientSize
+            POLLIN,
+            0
+        }
+    );
+
+    /*
+     * Each client needs its own input buffer because a RESP
+     * command can arrive across multiple TCP packets.
+     */
+    std::unordered_map<int, std::string>
+        clientBuffers;
+
+    while (true) {
+        int readyCount = poll(
+            sockets.data(),
+            static_cast<nfds_t>(sockets.size()),
+            -1
         );
 
-        if (clientSocket == -1) {
-            std::cerr
-                << "Failed to accept connection\n";
+        if (readyCount < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
 
-            continue;
+            std::cerr << "poll failed\n";
+            break;
         }
 
-        std::cout << "Client connected\n";
+        /*
+         * The listening socket has a new connection.
+         */
+        if (sockets[0].revents & POLLIN) {
+            sockaddr_in clientAddress{};
 
-        handleClient(
-            clientSocket,
-            database,
-            aof
-        );
+            socklen_t clientSize =
+                sizeof(clientAddress);
 
-        std::cout << "Client disconnected\n";
+            int clientSocket = accept(
+                serverSocket,
+                reinterpret_cast<sockaddr*>(
+                    &clientAddress
+                ),
+                &clientSize
+            );
+
+            if (clientSocket == -1) {
+                std::cerr
+                    << "Failed to accept connection\n";
+            } else {
+                sockets.push_back(
+                    pollfd{
+                        clientSocket,
+                        POLLIN,
+                        0
+                    }
+                );
+
+                clientBuffers.emplace(
+                    clientSocket,
+                    std::string{}
+                );
+
+                std::cout
+                    << "Client connected: socket "
+                    << clientSocket
+                    << '\n';
+            }
+        }
+
+        /*
+         * Check every connected client.
+         */
+        std::size_t index = 1;
+
+        while (index < sockets.size()) {
+            int clientSocket =
+                sockets[index].fd;
+
+            short events =
+                sockets[index].revents;
+
+            bool keepClient = true;
+
+            if (
+                events &
+                (POLLERR | POLLNVAL)
+            ) {
+                keepClient = false;
+            }
+
+            if (
+                keepClient &&
+                (events & POLLIN)
+            ) {
+                keepClient = processClientData(
+                    clientSocket,
+                    clientBuffers[clientSocket],
+                    database,
+                    aof
+                );
+            }
+
+            if (events & POLLHUP) {
+                keepClient = false;
+            }
+
+            if (!keepClient) {
+                std::cout
+                    << "Client disconnected: socket "
+                    << clientSocket
+                    << '\n';
+
+                close(clientSocket);
+                clientBuffers.erase(clientSocket);
+
+                sockets.erase(
+                    sockets.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        index
+                    )
+                );
+
+                /*
+                 * Do not increment index because the next
+                 * socket moved into the current position.
+                 */
+                continue;
+            }
+
+            ++index;
+        }
+    }
+
+    for (
+        std::size_t index = 1;
+        index < sockets.size();
+        ++index
+    ) {
+        close(sockets[index].fd);
     }
 
     close(serverSocket);
