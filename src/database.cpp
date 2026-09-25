@@ -9,10 +9,8 @@ bool Database::removeIfExpired(
         return false;
     }
 
-    if (
-        entry->second.expiresAt.has_value() &&
-        Clock::now() >= entry->second.expiresAt.value()
-    ) {
+    if (entry->second.expiresAt &&
+        Clock::now() >= *entry->second.expiresAt) {
         data.erase(entry);
         return true;
     }
