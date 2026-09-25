@@ -220,7 +220,6 @@ Expected raw response:
 - Replication and clustering are not supported.
 
 ## Roadmap
-
 - [x] In-memory key-value storage
 - [x] Basic commands
 - [x] TCP server
@@ -229,9 +228,10 @@ Expected raw response:
 - [x] `redis-cli` compatibility
 - [x] `EXPIRE` and `TTL`
 - [ ] Active expiration cleanup
-- [ ] Append-only file persistence
-- [ ] Non-blocking event loop
-- [ ] Concurrent client handling
+- [x] Append-only file persistence
+- [x] Poll-based event loop
+- [x] Concurrent client handling
+- [ ] Fully non-blocking socket I/O
 - [ ] Memory limits and LRU eviction
 - [ ] Automated tests
 - [ ] Performance benchmarks
