@@ -233,7 +233,7 @@ Expected raw response:
 - [ ] Non-blocking event loop
 - [ ] Concurrent client handling
 - [ ] Memory limits and LRU eviction
-- [ ] Automated tests
+- [x] Automated tests
 - [ ] Performance benchmarks
 - [ ] Additional Redis data types
 
