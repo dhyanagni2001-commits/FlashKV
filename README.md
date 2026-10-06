@@ -1,6 +1,30 @@
 # FlashKV
 
+[![CI](https://github.com/dhyanagni2001-commits/FlashKV/actions/workflows/ci.yml/badge.svg)](https://github.com/dhyanagni2001-commits/FlashKV/actions/workflows/ci.yml)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
+![Peak throughput](https://img.shields.io/badge/peak-3.27M%20ops%2Fsec-brightgreen)
+![GET](https://img.shields.io/badge/GET-233k%20ops%2Fsec-brightgreen)
+![Tests](https://img.shields.io/badge/tests-29%20unit%20%2B%2042%20integration-success)
+![Redis commands](https://img.shields.io/badge/Redis%20commands-53-red)
+
 **[▶ Live demo](https://dhyanagni2001-commits.github.io/FlashKV/)**: try the real engine in your browser, compiled to WebAssembly.
+
+## Results at a Glance
+
+| Metric | Result |
+|---|---|
+| Peak throughput (`PING`, pipeline 16) | **3.27 million ops/sec** |
+| Pipelined `GET` / `SET` | **2.17M / 1.15M ops/sec** |
+| Unpipelined `GET` / `SET` (50 clients) | **233k / 164k ops/sec** |
+| Median latency (`GET`, 50 clients) | **0.20 ms** (p99 0.43 ms) |
+| AOF crash recovery | **5.8M commands (244 MB) replayed in 1.65 s** |
+| Redis commands supported | **53**, across strings, lists, hashes and sets |
+| Concurrent clients tested | **40 simultaneous** clients, plus a 5 MB pipelined burst |
+| Automated tests | **29 unit + 42 integration checks**, run in CI on Linux and macOS with ASan/UBSan |
+| Codebase | **~4,100 lines** of dependency-free C++20 |
+| Browser build | Full engine in a **286 KB** self-contained WebAssembly page |
+
+All throughput numbers were measured with the AOF enabled, on an Apple M5 Pro with 50 clients and 16-byte values. See [Benchmarks](#benchmarks) for the full table and how to reproduce it.
 
 FlashKV is a lightweight, Redis-compatible, in-memory key-value database built from scratch in C++20.
 
