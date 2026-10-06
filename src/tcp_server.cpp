@@ -1,616 +1,625 @@
 #include "aof.hpp"
+#include "commands.hpp"
 #include "database.hpp"
 #include "resp.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cerrno>
-#include <charconv>
 #include <chrono>
-#include <cctype>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <string>
-#include <system_error>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
-bool parseIntegerArgument(
-    const std::string& text,
-    long long& value
-) {
-    const char* begin = text.data();
-    const char* end = text.data() + text.size();
+namespace {
 
-    auto result = std::from_chars(
-        begin,
-        end,
-        value
-    );
+constexpr int CONNECTION_BACKLOG = 511;
+constexpr std::size_t READ_CHUNK_SIZE = 16 * 1024;
 
-    return result.ec == std::errc{} &&
-           result.ptr == end;
+// Reads per client per loop iteration, so one busy client
+// cannot starve the others.
+constexpr int MAX_READS_PER_EVENT = 16;
+
+// Closes clients that send oversized partial commands.
+constexpr std::size_t MAX_QUERY_BUFFER = 1024 * 1024 * 1024;
+
+// Stop reading from a client whose replies are not being consumed.
+constexpr std::size_t OUTPUT_HIGH_WATERMARK = 4 * 1024 * 1024;
+
+volatile std::sig_atomic_t shutdownRequested = 0;
+
+void handleShutdownSignal(int) {
+    shutdownRequested = 1;
 }
 
-long long currentUnixSeconds() {
-    return std::chrono::duration_cast<
-        std::chrono::seconds
-    >(
-        std::chrono::system_clock::now()
-            .time_since_epoch()
-    ).count();
+struct ServerConfig {
+    std::string bindAddress = "127.0.0.1";
+    int port = 6379;
+    bool appendOnly = true;
+    std::string aofPath = "flashkv.aof";
+    std::size_t maxMemory = 0;
+    EvictionPolicy evictionPolicy = EvictionPolicy::NoEviction;
+    int hz = 10;
+};
+
+struct Client {
+    std::string input;
+    std::string output;
+    std::size_t outputOffset = 0;
+    bool closeAfterWrite = false;
+
+    std::size_t pendingOutput() const {
+        return output.size() - outputOffset;
+    }
+};
+
+void printUsage(const char* program) {
+    std::cout
+        << "Usage: " << program << " [options]\n\n"
+        << "Options:\n"
+        << "  --bind <address>            Address to listen on "
+           "(default 127.0.0.1)\n"
+        << "  --port <port>               TCP port (default 6379)\n"
+        << "  --appendonly <yes|no>       Enable AOF persistence "
+           "(default yes)\n"
+        << "  --aof <path>                AOF file path "
+           "(default flashkv.aof)\n"
+        << "  --maxmemory <bytes>         Memory limit, e.g. 100mb "
+           "(default 0 = unlimited)\n"
+        << "  --maxmemory-policy <name>   noeviction | allkeys-lru "
+           "(default noeviction)\n"
+        << "  --hz <n>                    Background task frequency "
+           "(default 10)\n"
+        << "  --help                      Show this message\n";
 }
 
-std::string executeCommand(
-    Database& database,
-    AppendOnlyFile& aof,
-    const std::vector<std::string>& arguments
+bool parseArguments(
+    int argc,
+    char** argv,
+    ServerConfig& config
 ) {
-    if (arguments.empty()) {
-        return respError("empty command");
+    for (int i = 1; i < argc; ++i) {
+        std::string option = argv[i];
+
+        if (option == "--help" || option == "-h") {
+            printUsage(argv[0]);
+            std::exit(0);
+        }
+
+        if (i + 1 >= argc) {
+            std::cerr << "Missing value for " << option << '\n';
+            return false;
+        }
+
+        std::string value = argv[++i];
+
+        try {
+            if (option == "--bind") {
+                config.bindAddress = value;
+            } else if (option == "--port") {
+                config.port = std::stoi(value);
+
+                if (config.port <= 0 || config.port > 65535) {
+                    throw std::out_of_range("port");
+                }
+            } else if (option == "--appendonly") {
+                if (value != "yes" && value != "no") {
+                    throw std::invalid_argument("appendonly");
+                }
+
+                config.appendOnly = value == "yes";
+            } else if (option == "--aof") {
+                config.aofPath = value;
+            } else if (option == "--maxmemory") {
+                auto bytes = parseMemorySize(value);
+
+                if (!bytes.has_value()) {
+                    throw std::invalid_argument("maxmemory");
+                }
+
+                config.maxMemory = *bytes;
+            } else if (option == "--maxmemory-policy") {
+                auto policy = parseEvictionPolicy(value);
+
+                if (!policy.has_value()) {
+                    throw std::invalid_argument("maxmemory-policy");
+                }
+
+                config.evictionPolicy = *policy;
+            } else if (option == "--hz") {
+                config.hz = std::stoi(value);
+
+                if (config.hz < 1 || config.hz > 500) {
+                    throw std::out_of_range("hz");
+                }
+            } else {
+                std::cerr << "Unknown option: " << option << '\n';
+                return false;
+            }
+        } catch (const std::exception&) {
+            std::cerr << "Invalid value for " << option
+                      << ": " << value << '\n';
+            return false;
+        }
     }
 
-    std::string command = arguments[0];
+    return true;
+}
 
-    std::transform(
-        command.begin(),
-        command.end(),
-        command.begin(),
-        [](unsigned char character) {
-            return static_cast<char>(
-                std::toupper(character)
-            );
-        }
+bool setNonBlocking(int socket) {
+    int flags = fcntl(socket, F_GETFL, 0);
+
+    return flags != -1 &&
+           fcntl(socket, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+
+int createListener(const ServerConfig& config) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (listener == -1) {
+        std::cerr << "Failed to create socket: "
+                  << std::strerror(errno) << '\n';
+        return -1;
+    }
+
+    int enabled = 1;
+
+    setsockopt(
+        listener,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &enabled,
+        sizeof(enabled)
     );
 
-    if (command == "PING") {
-        if (arguments.size() == 1) {
-            return respSimpleString("PONG");
-        }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<uint16_t>(config.port));
 
-        if (arguments.size() == 2) {
-            return respBulkString(arguments[1]);
-        }
-
-        return respError(
-            "wrong number of arguments for 'PING'"
-        );
+    if (inet_pton(
+            AF_INET,
+            config.bindAddress.c_str(),
+            &address.sin_addr
+        ) != 1) {
+        std::cerr << "Invalid bind address: "
+                  << config.bindAddress << '\n';
+        close(listener);
+        return -1;
     }
 
-    if (command == "ECHO") {
-        if (arguments.size() != 2) {
-            return respError(
-                "wrong number of arguments for 'ECHO'"
-            );
-        }
-
-        return respBulkString(arguments[1]);
+    if (bind(
+            listener,
+            reinterpret_cast<sockaddr*>(&address),
+            sizeof(address)
+        ) == -1) {
+        std::cerr << "Failed to bind to "
+                  << config.bindAddress << ':' << config.port
+                  << ": " << std::strerror(errno) << '\n';
+        close(listener);
+        return -1;
     }
 
-    if (command == "SET") {
-        if (arguments.size() != 3) {
-            return respError(
-                "wrong number of arguments for 'SET'"
-            );
-        }
-
-        if (!aof.append(arguments)) {
-            return respError(
-                "failed to persist SET command"
-            );
-        }
-
-        database.set(
-            arguments[1],
-            arguments[2]
-        );
-
-        return respSimpleString("OK");
+    if (listen(listener, CONNECTION_BACKLOG) == -1 ||
+        !setNonBlocking(listener)) {
+        std::cerr << "Failed to listen: "
+                  << std::strerror(errno) << '\n';
+        close(listener);
+        return -1;
     }
 
-    if (command == "GET") {
-        if (arguments.size() != 2) {
-            return respError(
-                "wrong number of arguments for 'GET'"
-            );
-        }
+    return listener;
+}
 
-        auto value = database.get(arguments[1]);
-
-        if (!value.has_value()) {
-            return respNull();
-        }
-
-        return respBulkString(value.value());
+class Server {
+public:
+    Server(
+        const ServerConfig& config,
+        Database& database,
+        AppendOnlyFile* aof
+    )
+        : config(config),
+          database(database),
+          aof(aof),
+          processor(database, aof) {
+        processor.stats().port = config.port;
     }
 
-    if (command == "DEL") {
-        if (arguments.size() < 2) {
-            return respError(
-                "wrong number of arguments for 'DEL'"
-            );
-        }
+    int run(int listener) {
+        using SteadyClock = std::chrono::steady_clock;
 
-        if (!aof.append(arguments)) {
-            return respError(
-                "failed to persist DEL command"
-            );
-        }
+        const auto cronInterval =
+            std::chrono::milliseconds(1000 / config.hz);
 
-        long long deletedCount = 0;
+        auto nextCron = SteadyClock::now() + cronInterval;
+        auto nextSync = SteadyClock::now() + std::chrono::seconds(1);
 
-        for (
-            std::size_t index = 1;
-            index < arguments.size();
-            ++index
-        ) {
-            if (database.del(arguments[index])) {
-                ++deletedCount;
+        std::vector<pollfd> descriptors;
+
+        while (!shutdownRequested) {
+            descriptors.clear();
+            descriptors.push_back({listener, POLLIN, 0});
+
+            for (const auto& [socket, client] : clients) {
+                short events = 0;
+
+                // Backpressure: pause reading while replies pile up.
+                if (client.pendingOutput() < OUTPUT_HIGH_WATERMARK &&
+                    !client.closeAfterWrite) {
+                    events |= POLLIN;
+                }
+
+                if (client.pendingOutput() > 0) {
+                    events |= POLLOUT;
+                }
+
+                descriptors.push_back({socket, events, 0});
             }
-        }
 
-        return respInteger(deletedCount);
-    }
+            auto timeout = std::chrono::duration_cast<
+                std::chrono::milliseconds
+            >(nextCron - SteadyClock::now()).count();
 
-    if (command == "EXISTS") {
-        if (arguments.size() < 2) {
-            return respError(
-                "wrong number of arguments for 'EXISTS'"
+            int ready = poll(
+                descriptors.data(),
+                static_cast<nfds_t>(descriptors.size()),
+                static_cast<int>(std::max<long long>(timeout, 0))
             );
-        }
 
-        long long existingCount = 0;
+            if (ready < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
 
-        for (
-            std::size_t index = 1;
-            index < arguments.size();
-            ++index
-        ) {
-            if (database.exists(arguments[index])) {
-                ++existingCount;
+                std::cerr << "poll failed: "
+                          << std::strerror(errno) << '\n';
+                return 1;
             }
-        }
 
-        return respInteger(existingCount);
-    }
+            if (descriptors[0].revents & POLLIN) {
+                acceptClients(listener);
+            }
 
-    if (command == "EXPIRE") {
-        if (arguments.size() != 3) {
-            return respError(
-                "wrong number of arguments for 'EXPIRE'"
-            );
-        }
-
-        long long seconds = 0;
-
-        if (
-            !parseIntegerArgument(
-                arguments[2],
-                seconds
-            )
-        ) {
-            return respError(
-                "value is not an integer or out of range"
-            );
-        }
-
-        if (!database.exists(arguments[1])) {
-            return respInteger(0);
-        }
-
-        if (seconds <= 0) {
-            std::vector<std::string> deleteCommand{
-                "DEL",
-                arguments[1]
-            };
-
-            if (!aof.append(deleteCommand)) {
-                return respError(
-                    "failed to persist expiration"
+            for (std::size_t i = 1; i < descriptors.size(); ++i) {
+                handleClientEvents(
+                    descriptors[i].fd,
+                    descriptors[i].revents
                 );
             }
 
-            database.del(arguments[1]);
-            return respInteger(1);
+            auto now = SteadyClock::now();
+
+            if (now >= nextCron) {
+                database.activeExpireCycle();
+                nextCron = now + cronInterval;
+            }
+
+            if (aof != nullptr && now >= nextSync) {
+                aof->sync();
+                nextSync = now + std::chrono::seconds(1);
+            }
         }
 
-        const long long expirationTime =
-            currentUnixSeconds() + seconds;
+        std::cout << "\nShutting down FlashKV...\n";
 
-        std::vector<std::string> expireAtCommand{
-            "EXPIREAT",
-            arguments[1],
-            std::to_string(expirationTime)
-        };
-
-        if (!aof.append(expireAtCommand)) {
-            return respError(
-                "failed to persist EXPIRE command"
-            );
+        for (const auto& [socket, client] : clients) {
+            close(socket);
         }
 
-        database.expire(
-            arguments[1],
-            seconds
-        );
-
-        return respInteger(1);
+        clients.clear();
+        return 0;
     }
 
-    if (command == "TTL") {
-        if (arguments.size() != 2) {
-            return respError(
-                "wrong number of arguments for 'TTL'"
-            );
-        }
+private:
+    const ServerConfig& config;
+    Database& database;
+    AppendOnlyFile* aof;
+    CommandProcessor processor;
+    std::unordered_map<int, Client> clients;
 
-        return respInteger(
-            database.ttl(arguments[1])
-        );
-    }
+    void acceptClients(int listener) {
+        while (true) {
+            int socket = accept(listener, nullptr, nullptr);
 
-    return respError(
-        "unknown command '" +
-        arguments[0] +
-        "'"
-    );
-}
+            if (socket == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
 
-bool sendAll(
-    int clientSocket,
-    const std::string& response
-) {
-    std::size_t totalSent = 0;
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    std::cerr << "accept failed: "
+                              << std::strerror(errno) << '\n';
+                }
 
-    while (totalSent < response.size()) {
-        ssize_t bytesSent = send(
-            clientSocket,
-            response.data() + totalSent,
-            response.size() - totalSent,
-            0
-        );
+                return;
+            }
 
-        if (bytesSent < 0 && errno == EINTR) {
-            continue;
-        }
+            if (!setNonBlocking(socket)) {
+                close(socket);
+                continue;
+            }
 
-        if (bytesSent <= 0) {
-            return false;
-        }
+            int enabled = 1;
 
-        totalSent +=
-            static_cast<std::size_t>(bytesSent);
-    }
-
-    return true;
-}
-
-bool processClientData(
-    int clientSocket,
-    std::string& pendingData,
-    Database& database,
-    AppendOnlyFile& aof
-) {
-    char buffer[4096];
-
-    ssize_t bytesReceived;
-
-    do {
-        bytesReceived = recv(
-            clientSocket,
-            buffer,
-            sizeof(buffer),
-            0
-        );
-    } while (
-        bytesReceived < 0 &&
-        errno == EINTR
-    );
-
-    if (bytesReceived <= 0) {
-        return false;
-    }
-
-    pendingData.append(
-        buffer,
-        static_cast<std::size_t>(
-            bytesReceived
-        )
-    );
-
-    while (true) {
-        RespParseResult result =
-            parseRespCommand(pendingData);
-
-        if (
-            result.status ==
-            RespParseStatus::Incomplete
-        ) {
-            break;
-        }
-
-        if (
-            result.status ==
-            RespParseStatus::Error
-        ) {
-            sendAll(
-                clientSocket,
-                respError(result.error)
+            // Replies are small; send them without Nagle delays.
+            setsockopt(
+                socket,
+                IPPROTO_TCP,
+                TCP_NODELAY,
+                &enabled,
+                sizeof(enabled)
             );
 
-            return false;
-        }
-
-        pendingData.erase(
-            0,
-            result.consumedBytes
-        );
-
-        std::string response =
-            executeCommand(
-                database,
-                aof,
-                result.arguments
+#ifdef SO_NOSIGPIPE
+            setsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &enabled,
+                sizeof(enabled)
             );
+#endif
 
-        if (
-            !sendAll(
-                clientSocket,
-                response
-            )
-        ) {
-            return false;
+            clients.emplace(socket, Client{});
+
+            ServerStats& stats = processor.stats();
+            ++stats.totalConnections;
+            stats.connectedClients = clients.size();
         }
     }
 
-    return true;
-}
+    void handleClientEvents(int socket, short events) {
+        auto entry = clients.find(socket);
 
-int main() {
-    constexpr int PORT = 6379;
-    constexpr int CONNECTION_BACKLOG = 128;
-
-    std::signal(SIGPIPE, SIG_IGN);
-
-    Database database;
-    AppendOnlyFile aof("flashkv.aof");
-
-    if (!aof.load(database)) {
-        std::cerr
-            << "Failed to load flashkv.aof\n";
-
-        return 1;
-    }
-
-    std::cout << "AOF data loaded\n";
-
-    int serverSocket = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
-
-    if (serverSocket == -1) {
-        std::cerr
-            << "Failed to create socket\n";
-
-        return 1;
-    }
-
-    int option = 1;
-
-    if (
-        setsockopt(
-            serverSocket,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &option,
-            sizeof(option)
-        ) == -1
-    ) {
-        std::cerr
-            << "Failed to configure socket\n";
-
-        close(serverSocket);
-        return 1;
-    }
-
-    sockaddr_in serverAddress{};
-
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(PORT);
-    serverAddress.sin_addr.s_addr =
-        htonl(INADDR_LOOPBACK);
-
-    if (
-        bind(
-            serverSocket,
-            reinterpret_cast<sockaddr*>(
-                &serverAddress
-            ),
-            sizeof(serverAddress)
-        ) == -1
-    ) {
-        std::cerr
-            << "Failed to bind to port "
-            << PORT
-            << '\n';
-
-        close(serverSocket);
-        return 1;
-    }
-
-    if (
-        listen(
-            serverSocket,
-            CONNECTION_BACKLOG
-        ) == -1
-    ) {
-        std::cerr
-            << "Failed to listen\n";
-
-        close(serverSocket);
-        return 1;
-    }
-
-    std::cout
-        << "FlashKV listening on 127.0.0.1:"
-        << PORT
-        << '\n';
-
-    /*
-     * Index 0 always contains the listening socket.
-     * The remaining entries represent connected clients.
-     */
-    std::vector<pollfd> sockets;
-
-    sockets.push_back(
-        pollfd{
-            serverSocket,
-            POLLIN,
-            0
+        if (entry == clients.end()) {
+            return;
         }
-    );
 
-    /*
-     * Each client needs its own input buffer because a RESP
-     * command can arrive across multiple TCP packets.
-     */
-    std::unordered_map<int, std::string>
-        clientBuffers;
+        Client& client = entry->second;
+        bool keep = true;
 
-    while (true) {
-        int readyCount = poll(
-            sockets.data(),
-            static_cast<nfds_t>(sockets.size()),
-            -1
-        );
+        if (events & (POLLERR | POLLNVAL)) {
+            keep = false;
+        }
 
-        if (readyCount < 0) {
+        if (keep && (events & (POLLIN | POLLHUP))) {
+            keep = readFromClient(socket, client);
+        }
+
+        if (keep && client.pendingOutput() > 0) {
+            // Replies may only leave once their writes are in the AOF.
+            if (aof != nullptr) {
+                aof->flush();
+            }
+
+            keep = writeToClient(socket, client);
+        }
+
+        if (keep && client.closeAfterWrite &&
+            client.pendingOutput() == 0) {
+            keep = false;
+        }
+
+        if (!keep) {
+            close(socket);
+            clients.erase(entry);
+            processor.stats().connectedClients = clients.size();
+        }
+    }
+
+    // Returns false when the connection should be closed.
+    bool readFromClient(int socket, Client& client) {
+        char buffer[READ_CHUNK_SIZE];
+
+        for (int reads = 0; reads < MAX_READS_PER_EVENT; ++reads) {
+            ssize_t received = recv(socket, buffer, sizeof(buffer), 0);
+
+            if (received > 0) {
+                client.input.append(
+                    buffer,
+                    static_cast<std::size_t>(received)
+                );
+
+                if (static_cast<std::size_t>(received) < sizeof(buffer)) {
+                    break;
+                }
+
+                continue;
+            }
+
+            if (received == 0) {
+                // Peer closed; still answer anything already buffered.
+                processInput(client);
+                client.closeAfterWrite = true;
+                return true;
+            }
+
             if (errno == EINTR) {
                 continue;
             }
 
-            std::cerr << "poll failed\n";
-            break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+
+            return false;
         }
 
-        /*
-         * The listening socket has a new connection.
-         */
-        if (sockets[0].revents & POLLIN) {
-            sockaddr_in clientAddress{};
+        if (client.input.size() > MAX_QUERY_BUFFER) {
+            std::cerr << "Closing client: query buffer limit exceeded\n";
+            return false;
+        }
 
-            socklen_t clientSize =
-                sizeof(clientAddress);
+        processInput(client);
+        return true;
+    }
 
-            int clientSocket = accept(
-                serverSocket,
-                reinterpret_cast<sockaddr*>(
-                    &clientAddress
-                ),
-                &clientSize
+    void processInput(Client& client) {
+        std::size_t consumed = 0;
+
+        while (!client.closeAfterWrite &&
+               consumed < client.input.size()) {
+            std::string_view pending(
+                client.input.data() + consumed,
+                client.input.size() - consumed
             );
 
-            if (clientSocket == -1) {
-                std::cerr
-                    << "Failed to accept connection\n";
-            } else {
-                sockets.push_back(
-                    pollfd{
-                        clientSocket,
-                        POLLIN,
-                        0
-                    }
-                );
+            RespParseResult result = parseRespCommand(pending);
 
-                clientBuffers.emplace(
-                    clientSocket,
-                    std::string{}
-                );
-
-                std::cout
-                    << "Client connected: socket "
-                    << clientSocket
-                    << '\n';
-            }
-        }
-
-        /*
-         * Check every connected client.
-         */
-        std::size_t index = 1;
-
-        while (index < sockets.size()) {
-            int clientSocket =
-                sockets[index].fd;
-
-            short events =
-                sockets[index].revents;
-
-            bool keepClient = true;
-
-            if (
-                events &
-                (POLLERR | POLLNVAL)
-            ) {
-                keepClient = false;
+            if (result.status == RespParseStatus::Incomplete) {
+                break;
             }
 
-            if (
-                keepClient &&
-                (events & POLLIN)
-            ) {
-                keepClient = processClientData(
-                    clientSocket,
-                    clientBuffers[clientSocket],
-                    database,
-                    aof
-                );
+            if (result.status == RespParseStatus::Error) {
+                client.output += respError(result.error);
+                client.closeAfterWrite = true;
+                break;
             }
 
-            if (events & POLLHUP) {
-                keepClient = false;
-            }
+            consumed += result.consumedBytes;
 
-            if (!keepClient) {
-                std::cout
-                    << "Client disconnected: socket "
-                    << clientSocket
-                    << '\n';
-
-                close(clientSocket);
-                clientBuffers.erase(clientSocket);
-
-                sockets.erase(
-                    sockets.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        index
-                    )
-                );
-
-                /*
-                 * Do not increment index because the next
-                 * socket moved into the current position.
-                 */
+            // Blank inline lines are ignored, as in Redis.
+            if (result.arguments.empty()) {
                 continue;
             }
 
-            ++index;
+            CommandReply reply = processor.execute(result.arguments);
+            client.output += reply.payload;
+
+            if (reply.closeConnection) {
+                client.closeAfterWrite = true;
+            }
         }
+
+        client.input.erase(0, consumed);
     }
 
-    for (
-        std::size_t index = 1;
-        index < sockets.size();
-        ++index
-    ) {
-        close(sockets[index].fd);
+    bool writeToClient(int socket, Client& client) {
+        while (client.pendingOutput() > 0) {
+            int flags = 0;
+
+#ifdef MSG_NOSIGNAL
+            flags |= MSG_NOSIGNAL;
+#endif
+
+            ssize_t sent = send(
+                socket,
+                client.output.data() + client.outputOffset,
+                client.pendingOutput(),
+                flags
+            );
+
+            if (sent > 0) {
+                client.outputOffset += static_cast<std::size_t>(sent);
+                continue;
+            }
+
+            if (sent < 0 && errno == EINTR) {
+                continue;
+            }
+
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // Socket buffer full; POLLOUT resumes the write.
+                break;
+            }
+
+            return false;
+        }
+
+        // Compact once the buffer is fully sent or mostly consumed.
+        if (client.outputOffset == client.output.size()) {
+            client.output.clear();
+            client.outputOffset = 0;
+        } else if (client.outputOffset > client.output.size() / 2) {
+            client.output.erase(0, client.outputOffset);
+            client.outputOffset = 0;
+        }
+
+        return true;
+    }
+};
+
+} // namespace
+
+int main(int argc, char** argv) {
+    ServerConfig config;
+
+    if (!parseArguments(argc, argv, config)) {
+        printUsage(argv[0]);
+        return 1;
     }
 
-    close(serverSocket);
-    return 0;
+    std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT, handleShutdownSignal);
+    std::signal(SIGTERM, handleShutdownSignal);
+
+    Database database;
+    std::unique_ptr<AppendOnlyFile> aof;
+
+    if (config.appendOnly) {
+        aof = std::make_unique<AppendOnlyFile>(config.aofPath);
+
+        // Replay without an AOF attached so commands are not re-logged.
+        CommandProcessor replayer(database);
+        std::string error;
+
+        bool loaded = aof->load(
+            [&replayer](
+                const std::vector<std::string>& arguments,
+                std::string& replayError
+            ) {
+                CommandReply reply = replayer.execute(arguments);
+
+                if (!reply.payload.empty() && reply.payload[0] == '-') {
+                    replayError = reply.payload.substr(
+                        1,
+                        reply.payload.size() - 3
+                    );
+                    return false;
+                }
+
+                return true;
+            },
+            error
+        );
+
+        if (!loaded || !aof->open(error)) {
+            std::cerr << "Failed to load " << config.aofPath
+                      << ": " << error << '\n';
+            return 1;
+        }
+
+        std::cout << "AOF loaded: " << database.size()
+                  << " keys from " << config.aofPath << '\n';
+    }
+
+    // Applied after replay so loading never evicts.
+    database.setMaxMemory(config.maxMemory);
+    database.setEvictionPolicy(config.evictionPolicy);
+
+    int listener = createListener(config);
+
+    if (listener == -1) {
+        return 1;
+    }
+
+    std::cout << "FlashKV " << FLASHKV_VERSION << " listening on "
+              << config.bindAddress << ':' << config.port << '\n'
+              << std::flush;
+
+    Server server(config, database, aof.get());
+    int status = server.run(listener);
+
+    close(listener);
+    return status;
 }

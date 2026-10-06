@@ -1,3 +1,5 @@
 build/
+build-*/
+web/dist/
 .DS_Store
 flashkv.aof

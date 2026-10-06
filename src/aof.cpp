@@ -1,153 +1,36 @@
 #include "aof.hpp"
 #include "resp.hpp"
 
-#include <algorithm>
-#include <charconv>
-#include <chrono>
-#include <cctype>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <string_view>
-#include <system_error>
+#include <unistd.h>
+#include <utility>
 
-namespace {
+AppendOnlyFile::AppendOnlyFile(std::string path)
+    : filePath(std::move(path)) {
+}
 
-bool parseInteger(
-    const std::string& text,
-    long long& value
+AppendOnlyFile::~AppendOnlyFile() {
+    flush();
+    sync();
+
+    if (fileDescriptor != -1) {
+        close(fileDescriptor);
+    }
+}
+
+bool AppendOnlyFile::load(
+    const ReplayFunction& replay,
+    std::string& error
 ) {
-    const char* begin = text.data();
-    const char* end = text.data() + text.size();
+    std::ifstream input(filePath, std::ios::binary);
 
-    auto result = std::from_chars(
-        begin,
-        end,
-        value
-    );
-
-    return result.ec == std::errc{} &&
-           result.ptr == end;
-}
-
-std::string uppercase(std::string value) {
-    std::transform(
-        value.begin(),
-        value.end(),
-        value.begin(),
-        [](unsigned char character) {
-            return static_cast<char>(
-                std::toupper(character)
-            );
-        }
-    );
-
-    return value;
-}
-
-long long currentUnixSeconds() {
-    return std::chrono::duration_cast<
-        std::chrono::seconds
-    >(
-        std::chrono::system_clock::now()
-            .time_since_epoch()
-    ).count();
-}
-
-} // namespace
-
-AppendOnlyFile::AppendOnlyFile(
-    const std::string& filePath
-)
-    : path(filePath),
-      output(
-          filePath,
-          std::ios::binary | std::ios::app
-      ) {
-}
-
-bool AppendOnlyFile::append(
-    const std::vector<std::string>& arguments
-) {
-    if (!output.is_open()) {
-        return false;
-    }
-
-    std::string encoded = respArray(arguments);
-
-    output.write(
-        encoded.data(),
-        static_cast<std::streamsize>(encoded.size())
-    );
-
-    output.flush();
-
-    return output.good();
-}
-
-bool AppendOnlyFile::applyCommand(
-    Database& database,
-    const std::vector<std::string>& arguments
-) {
-    if (arguments.empty()) {
-        return false;
-    }
-
-    std::string command = uppercase(arguments[0]);
-
-    if (command == "SET" && arguments.size() == 3) {
-        database.set(arguments[1], arguments[2]);
-        return true;
-    }
-
-    if (command == "DEL" && arguments.size() >= 2) {
-        for (std::size_t index = 1;
-             index < arguments.size();
-             ++index) {
-            database.del(arguments[index]);
-        }
-
-        return true;
-    }
-
-    /*
-     * Expirations are stored as absolute Unix timestamps.
-     * This prevents a five-second TTL from restarting at
-     * five seconds whenever FlashKV restarts.
-     */
-    if (
-        command == "EXPIREAT" &&
-        arguments.size() == 3
-    ) {
-        long long expirationTime = 0;
-
-        if (!parseInteger(
-                arguments[2],
-                expirationTime
-            )) {
-            return false;
-        }
-
-        long long remainingSeconds =
-            expirationTime - currentUnixSeconds();
-
-        database.expire(
-            arguments[1],
-            remainingSeconds
-        );
-
-        return true;
-    }
-
-    return false;
-}
-
-bool AppendOnlyFile::load(Database& database) {
-    std::ifstream input(
-        path,
-        std::ios::binary
-    );
-
+    // A missing file simply means an empty database.
     if (!input.is_open()) {
         return true;
     }
@@ -157,7 +40,10 @@ bool AppendOnlyFile::load(Database& database) {
         std::istreambuf_iterator<char>()
     };
 
+    input.close();
+
     std::size_t position = 0;
+    std::size_t commandNumber = 0;
 
     while (position < contents.size()) {
         std::string_view remaining(
@@ -165,33 +51,131 @@ bool AppendOnlyFile::load(Database& database) {
             contents.size() - position
         );
 
-        RespParseResult result =
-            parseRespCommand(remaining);
+        RespParseResult result = parseRespCommand(remaining);
 
-        if (
-            result.status !=
-            RespParseStatus::Complete
-        ) {
+        if (result.status == RespParseStatus::Incomplete) {
             std::cerr
-                << "Invalid or incomplete AOF data\n";
+                << "Warning: AOF ends with a truncated command; "
+                << "discarding the last "
+                << remaining.size()
+                << " bytes\n";
 
+            if (truncate(
+                    filePath.c_str(),
+                    static_cast<off_t>(position)
+                ) == -1) {
+                error = "failed to truncate AOF: " +
+                        std::string(std::strerror(errno));
+                return false;
+            }
+
+            return true;
+        }
+
+        if (result.status == RespParseStatus::Error) {
+            error = "invalid AOF data at byte " +
+                    std::to_string(position) + ": " +
+                    result.error;
             return false;
         }
 
-        if (
-            !applyCommand(
-                database,
-                result.arguments
-            )
-        ) {
-            std::cerr
-                << "Unsupported command in AOF\n";
+        ++commandNumber;
 
-            return false;
+        if (!result.arguments.empty()) {
+            std::string replayError;
+
+            if (!replay(result.arguments, replayError)) {
+                error = "AOF command #" +
+                        std::to_string(commandNumber) + " (" +
+                        result.arguments[0] + ") failed: " +
+                        replayError;
+                return false;
+            }
         }
 
         position += result.consumedBytes;
     }
 
     return true;
+}
+
+bool AppendOnlyFile::open(std::string& error) {
+    fileDescriptor = ::open(
+        filePath.c_str(),
+        O_WRONLY | O_APPEND | O_CREAT,
+        0644
+    );
+
+    if (fileDescriptor == -1) {
+        error = "failed to open " + filePath + ": " +
+                std::strerror(errno);
+        return false;
+    }
+
+    return true;
+}
+
+void AppendOnlyFile::append(
+    const std::vector<std::string>& arguments
+) {
+    buffer += respArray(arguments);
+}
+
+bool AppendOnlyFile::flush() {
+    if (buffer.empty()) {
+        return !writeFailed;
+    }
+
+    if (fileDescriptor == -1) {
+        return false;
+    }
+
+    std::size_t written = 0;
+
+    while (written < buffer.size()) {
+        ssize_t result = write(
+            fileDescriptor,
+            buffer.data() + written,
+            buffer.size() - written
+        );
+
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (result <= 0) {
+            std::cerr << "AOF write failed: "
+                      << std::strerror(errno) << '\n';
+
+            // Keep the unwritten data so a later flush can retry.
+            buffer.erase(0, written);
+            writeFailed = true;
+            return false;
+        }
+
+        written += static_cast<std::size_t>(result);
+    }
+
+    buffer.clear();
+    needsSync = true;
+    writeFailed = false;
+
+    return true;
+}
+
+bool AppendOnlyFile::sync() {
+    if (!needsSync || fileDescriptor == -1) {
+        return true;
+    }
+
+    needsSync = false;
+    return fsync(fileDescriptor) == 0;
+}
+
+bool AppendOnlyFile::healthy() const {
+    return !writeFailed;
+}
+
+const std::string& AppendOnlyFile::path() const {
+    return filePath;
 }
