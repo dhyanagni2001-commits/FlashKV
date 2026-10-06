@@ -1,12 +1,15 @@
 #include "resp.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <optional>
 #include <string_view>
 
 namespace {
 
-constexpr std::size_t MAX_ARGUMENTS = 1024;
-constexpr std::size_t MAX_BULK_SIZE = 16 * 1024 * 1024;
+constexpr std::size_t MAX_ARGUMENTS = 1024 * 1024;
+constexpr std::size_t MAX_BULK_SIZE = 512 * 1024 * 1024;
+constexpr std::size_t MAX_INLINE_SIZE = 64 * 1024;
 
 bool parseInteger(
     std::string_view text,
@@ -41,7 +44,163 @@ RespParseResult errorResult(
     };
 }
 
+int hexValue(char character) {
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+
+    return -1;
+}
+
+bool isSpace(char character) {
+    return character == ' ' || character == '\t' ||
+           character == '\r' || character == '\n';
+}
+
+RespParseResult parseInlineCommand(
+    std::string_view buffer
+) {
+    std::size_t lineEnd = buffer.find('\n');
+
+    if (lineEnd == std::string_view::npos) {
+        if (buffer.size() > MAX_INLINE_SIZE) {
+            return errorResult(
+                "Protocol error: too big inline request"
+            );
+        }
+
+        return incompleteResult();
+    }
+
+    std::optional<std::vector<std::string>> arguments =
+        tokenizeCommandLine(buffer.substr(0, lineEnd));
+
+    if (!arguments.has_value()) {
+        return errorResult(
+            "Protocol error: unbalanced quotes in request"
+        );
+    }
+
+    return {
+        RespParseStatus::Complete,
+        std::move(*arguments),
+        lineEnd + 1,
+        {}
+    };
+}
+
 } // namespace
+
+std::optional<std::vector<std::string>> tokenizeCommandLine(
+    std::string_view line
+) {
+    std::vector<std::string> arguments;
+    std::size_t position = 0;
+
+    while (true) {
+        while (position < line.size() &&
+               isSpace(line[position])) {
+            ++position;
+        }
+
+        if (position >= line.size()) {
+            return arguments;
+        }
+
+        std::string current;
+        bool inDoubleQuotes = false;
+        bool inSingleQuotes = false;
+
+        while (true) {
+            if (position >= line.size()) {
+                if (inDoubleQuotes || inSingleQuotes) {
+                    return std::nullopt;
+                }
+
+                break;
+            }
+
+            char character = line[position];
+
+            if (inDoubleQuotes) {
+                if (character == '\\' &&
+                    position + 1 < line.size()) {
+                    char escaped = line[++position];
+
+                    if (escaped == 'x' &&
+                        position + 2 < line.size() &&
+                        hexValue(line[position + 1]) >= 0 &&
+                        hexValue(line[position + 2]) >= 0) {
+                        current += static_cast<char>(
+                            hexValue(line[position + 1]) * 16 +
+                            hexValue(line[position + 2])
+                        );
+                        position += 2;
+                    } else {
+                        switch (escaped) {
+                        case 'n': current += '\n'; break;
+                        case 'r': current += '\r'; break;
+                        case 't': current += '\t'; break;
+                        case 'b': current += '\b'; break;
+                        case 'a': current += '\a'; break;
+                        default: current += escaped; break;
+                        }
+                    }
+                } else if (character == '"') {
+                    // A closing quote must end the argument.
+                    if (position + 1 < line.size() &&
+                        !isSpace(line[position + 1])) {
+                        return std::nullopt;
+                    }
+
+                    inDoubleQuotes = false;
+                    ++position;
+                    break;
+                } else {
+                    current += character;
+                }
+            } else if (inSingleQuotes) {
+                if (character == '\\' &&
+                    position + 1 < line.size() &&
+                    line[position + 1] == '\'') {
+                    current += '\'';
+                    ++position;
+                } else if (character == '\'') {
+                    if (position + 1 < line.size() &&
+                        !isSpace(line[position + 1])) {
+                        return std::nullopt;
+                    }
+
+                    inSingleQuotes = false;
+                    ++position;
+                    break;
+                } else {
+                    current += character;
+                }
+            } else if (isSpace(character)) {
+                break;
+            } else if (character == '"' && current.empty()) {
+                inDoubleQuotes = true;
+            } else if (character == '\'' && current.empty()) {
+                inSingleQuotes = true;
+            } else {
+                current += character;
+            }
+
+            ++position;
+        }
+
+        arguments.push_back(std::move(current));
+    }
+}
 
 RespParseResult parseRespCommand(
     std::string_view buffer
@@ -50,9 +209,10 @@ RespParseResult parseRespCommand(
         return incompleteResult();
     }
 
-    // Redis commands are represented as RESP arrays.
+    // Redis commands are normally RESP arrays; anything else is
+    // treated as an inline command.
     if (buffer.front() != '*') {
-        return errorResult("Expected RESP array");
+        return parseInlineCommand(buffer);
     }
 
     std::size_t countEnd = buffer.find("\r\n", 1);
@@ -81,8 +241,13 @@ RespParseResult parseRespCommand(
     std::size_t position = countEnd + 2;
     std::vector<std::string> arguments;
 
+    // Cap the reservation so a huge declared count cannot
+    // allocate memory before any data has arrived.
     arguments.reserve(
-        static_cast<std::size_t>(argumentCount)
+        std::min<std::size_t>(
+            static_cast<std::size_t>(argumentCount),
+            1024
+        )
     );
 
     for (long long index = 0;
@@ -179,6 +344,13 @@ std::string respError(
     return "-ERR " + message + "\r\n";
 }
 
+std::string respErrorWithCode(
+    const std::string& code,
+    const std::string& message
+) {
+    return "-" + code + " " + message + "\r\n";
+}
+
 std::string respInteger(long long value) {
     return ":" + std::to_string(value) + "\r\n";
 }
@@ -205,6 +377,19 @@ std::string respArray(
 
     for (const std::string& argument : arguments) {
         encoded += respBulkString(argument);
+    }
+
+    return encoded;
+}
+
+std::string respEncodedArray(
+    const std::vector<std::string>& encodedElements
+) {
+    std::string encoded =
+        "*" + std::to_string(encodedElements.size()) + "\r\n";
+
+    for (const std::string& element : encodedElements) {
+        encoded += element;
     }
 
     return encoded;

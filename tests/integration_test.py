@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+"""End-to-end tests that drive a real flashkv_server over TCP."""
 
+import argparse
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -12,6 +15,10 @@ PORT = 6379
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVER_BINARY = PROJECT_ROOT / "build" / "flashkv_server"
+
+
+class RedisError(Exception):
+    pass
 
 
 class RespClient:
@@ -46,6 +53,12 @@ class RespClient:
         self.socket.sendall(request)
         return self.read_response()
 
+    def command_or_error(self, *arguments):
+        try:
+            return self.command(*arguments)
+        except RedisError as error:
+            return error
+
     def read_response(self):
         prefix = self.reader.read(1)
 
@@ -56,8 +69,7 @@ class RespClient:
             return self.read_line()
 
         if prefix == b"-":
-            error = self.read_line()
-            raise RuntimeError(f"Redis error: {error}")
+            raise RedisError(self.read_line())
 
         if prefix == b":":
             return int(self.read_line())
@@ -77,6 +89,14 @@ class RespClient:
                 )
 
             return value.decode("utf-8")
+
+        if prefix == b"*":
+            count = int(self.read_line())
+
+            if count == -1:
+                return None
+
+            return [self.read_response() for _ in range(count)]
 
         raise RuntimeError(
             f"Unknown RESP prefix: {prefix!r}"
@@ -116,9 +136,15 @@ def port_is_in_use():
         )
 
 
-def start_server(working_directory):
+def find_free_port():
+    with socket.socket() as probe:
+        probe.bind((HOST, 0))
+        return probe.getsockname()[1]
+
+
+def start_server(working_directory, *extra_arguments):
     process = subprocess.Popen(
-        [str(SERVER_BINARY)],
+        [str(SERVER_BINARY), "--port", str(PORT), *extra_arguments],
         cwd=working_directory,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -312,6 +338,266 @@ def test_multiple_clients():
         second_client.close()
 
 
+def test_data_types():
+    client = RespClient()
+
+    try:
+        assert_equal(
+            client.command("RPUSH", "queue", "a", "b", "c"),
+            3,
+            "RPUSH",
+        )
+        assert_equal(
+            client.command("LPUSH", "queue", "start"),
+            4,
+            "LPUSH",
+        )
+        assert_equal(
+            client.command("LRANGE", "queue", 0, -1),
+            ["start", "a", "b", "c"],
+            "LRANGE",
+        )
+        assert_equal(
+            client.command("RPOP", "queue"),
+            "c",
+            "RPOP",
+        )
+        assert_equal(
+            client.command("HSET", "user:1", "name", "Ada", "lang", "C++"),
+            2,
+            "HSET",
+        )
+        assert_equal(
+            client.command("HGETALL", "user:1"),
+            ["lang", "C++", "name", "Ada"],
+            "HGETALL",
+        )
+        assert_equal(
+            client.command("SADD", "tags", "fast", "cpp", "fast"),
+            2,
+            "SADD",
+        )
+        assert_equal(
+            client.command("SMEMBERS", "tags"),
+            ["cpp", "fast"],
+            "SMEMBERS",
+        )
+        assert_equal(
+            client.command("INCRBY", "visits", 10),
+            10,
+            "INCRBY",
+        )
+        assert_equal(
+            client.command("TYPE", "user:1"),
+            "hash",
+            "TYPE",
+        )
+
+        error = client.command_or_error("GET", "queue")
+
+        if not isinstance(error, RedisError) or not str(error).startswith(
+            "WRONGTYPE"
+        ):
+            raise AssertionError(f"Expected WRONGTYPE, received {error!r}")
+
+        print("PASS: WRONGTYPE error")
+    finally:
+        client.close()
+
+
+def test_inline_and_partial_commands():
+    connection = socket.create_connection((HOST, PORT), timeout=2)
+
+    try:
+        connection.sendall(b'SET inline "hello world"\r\nGET inline\r\n')
+        expected = b"+OK\r\n$11\r\nhello world\r\n"
+        received = b""
+
+        while len(received) < len(expected):
+            received += connection.recv(1024)
+
+        assert_equal(received, expected, "Inline commands")
+
+        # Deliver a RESP command one byte at a time.
+        for byte in b"*2\r\n$4\r\nECHO\r\n$5\r\nbytes\r\n":
+            connection.sendall(bytes([byte]))
+            time.sleep(0.001)
+
+        assert_equal(
+            connection.recv(1024),
+            b"$5\r\nbytes\r\n",
+            "Byte-by-byte partial command",
+        )
+    finally:
+        connection.close()
+
+
+def test_large_pipeline():
+    """Replies larger than the socket buffer exercise POLLOUT writes."""
+    client = RespClient()
+    value = "v" * 1024
+    count = 5000
+
+    try:
+        client.command("SET", "big", value)
+
+        request = (
+            f"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".encode() * count
+        )
+
+        # Send from another thread while reading, like a real client.
+        sender = threading.Thread(
+            target=client.socket.sendall,
+            args=(request,),
+        )
+        sender.start()
+
+        for _ in range(count):
+            if client.read_response() != value:
+                raise AssertionError("Pipelined reply mismatch")
+
+        sender.join()
+        print(f"PASS: {count} pipelined GETs ({count * len(value) // 1024} KiB)")
+    finally:
+        client.close()
+
+
+def test_many_concurrent_clients():
+    errors = []
+
+    def worker(index):
+        try:
+            client = RespClient()
+
+            for step in range(50):
+                key = f"concurrent:{index}:{step}"
+                client.command("SET", key, step)
+
+                if client.command("GET", key) != str(step):
+                    errors.append(key)
+
+            client.command("INCR", "concurrent:total")
+            client.close()
+        except Exception as error:  # noqa: BLE001
+            errors.append(repr(error))
+
+    threads = [
+        threading.Thread(target=worker, args=(index,))
+        for index in range(40)
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    if errors:
+        raise AssertionError(f"Concurrent client errors: {errors[:3]}")
+
+    client = RespClient()
+
+    try:
+        assert_equal(
+            client.command("GET", "concurrent:total"),
+            "40",
+            "40 concurrent clients",
+        )
+    finally:
+        client.close()
+
+
+def info_field(client, name):
+    for line in client.command("INFO").splitlines():
+        if line.startswith(name + ":"):
+            return line.split(":", 1)[1]
+
+    raise AssertionError(f"INFO field {name} missing")
+
+
+def test_active_expiration():
+    client = RespClient()
+
+    try:
+        before = int(info_field(client, "expired_keys"))
+
+        for index in range(200):
+            client.command("SET", f"volatile:{index}", "x", "PX", 100)
+
+        # Never touch the keys again; the background cycle must
+        # reclaim them on its own.
+        time.sleep(1.0)
+
+        reclaimed = int(info_field(client, "expired_keys")) - before
+
+        if reclaimed < 200:
+            raise AssertionError(
+                f"Active expiry reclaimed only {reclaimed} of 200 keys"
+            )
+
+        print("PASS: Active expiration reclaimed 200 untouched keys")
+    finally:
+        client.close()
+
+
+def test_lru_eviction():
+    client = RespClient()
+
+    try:
+        client.command("FLUSHALL")
+        client.command("CONFIG", "SET", "maxmemory-policy", "allkeys-lru")
+        client.command("CONFIG", "SET", "maxmemory", "64kb")
+
+        client.command("SET", "hot", "keep me")
+
+        for index in range(2000):
+            client.command("SET", f"cold:{index}", "x" * 64)
+
+            # Keep "hot" recently used so LRU never picks it.
+            if index % 50 == 0:
+                client.command("GET", "hot")
+
+        used = int(info_field(client, "used_memory"))
+        evicted = int(info_field(client, "evicted_keys"))
+
+        if used > 64 * 1024 + 1024:
+            raise AssertionError(f"used_memory {used} exceeds maxmemory")
+
+        if evicted == 0:
+            raise AssertionError("No keys were evicted")
+
+        assert_equal(client.command("GET", "hot"), "keep me", "LRU keeps hot key")
+        assert_equal(client.command("EXISTS", "cold:0"), 0, "LRU evicts cold key")
+
+        # Like Redis, the limit is checked before each write, so push
+        # usage over the limit first, then expect the next write to fail.
+        client.command("CONFIG", "SET", "maxmemory-policy", "noeviction")
+        client.command_or_error("SET", "filler:1", "x" * 4096)
+        client.command_or_error("SET", "filler:2", "x" * 4096)
+        error = client.command_or_error("SET", "rejected", "x")
+
+        if not isinstance(error, RedisError) or not str(error).startswith("OOM"):
+            raise AssertionError(f"Expected OOM, received {error!r}")
+
+        print("PASS: noeviction returns OOM")
+
+        client.command("CONFIG", "SET", "maxmemory", "0")
+    finally:
+        client.close()
+
+
+def test_quit():
+    client = RespClient()
+
+    try:
+        assert_equal(client.command("QUIT"), "OK", "QUIT")
+
+        if client.reader.read(1) != b"":
+            raise AssertionError("Connection still open after QUIT")
+    finally:
+        client.close()
+
+
 def create_persistent_value():
     client = RespClient()
 
@@ -325,6 +611,10 @@ def create_persistent_value():
             "OK",
             "Create persistent value",
         )
+        client.command("RPUSH", "persistent:list", "a", "b")
+        client.command("HSET", "persistent:hash", "field", "value")
+        client.command("SADD", "persistent:set", "member")
+        client.command("SET", "persistent:ttl", "value", "EX", 100)
     finally:
         client.close()
 
@@ -338,11 +628,43 @@ def test_recovered_value():
             "survives-restart",
             "AOF restart recovery",
         )
+        assert_equal(
+            client.command("LRANGE", "persistent:list", 0, -1),
+            ["a", "b"],
+            "AOF restores lists",
+        )
+        assert_equal(
+            client.command("HGET", "persistent:hash", "field"),
+            "value",
+            "AOF restores hashes",
+        )
+        assert_equal(
+            client.command("SISMEMBER", "persistent:set", "member"),
+            1,
+            "AOF restores sets",
+        )
+
+        ttl = client.command("TTL", "persistent:ttl")
+
+        if not 95 <= ttl <= 100:
+            raise AssertionError(f"Restored TTL out of range: {ttl}")
+
+        print("PASS: AOF restores TTLs as absolute deadlines")
     finally:
         client.close()
 
 
 def main():
+    global PORT, SERVER_BINARY
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server", type=Path, default=SERVER_BINARY)
+    parser.add_argument("--port", type=int, default=0)
+    arguments = parser.parse_args()
+
+    SERVER_BINARY = arguments.server.resolve()
+    PORT = arguments.port or find_free_port()
+
     if not SERVER_BINARY.exists():
         raise RuntimeError(
             "Server binary was not found. Run:\n"
@@ -351,7 +673,7 @@ def main():
 
     if port_is_in_use():
         raise RuntimeError(
-            "Port 6379 is already in use. "
+            f"Port {PORT} is already in use. "
             "Stop the running server first."
         )
 
@@ -365,6 +687,13 @@ def main():
             test_basic_commands()
             test_expiration()
             test_multiple_clients()
+            test_data_types()
+            test_inline_and_partial_commands()
+            test_large_pipeline()
+            test_many_concurrent_clients()
+            test_active_expiration()
+            test_lru_eviction()
+            test_quit()
             create_persistent_value()
 
             print("Restarting FlashKV...")

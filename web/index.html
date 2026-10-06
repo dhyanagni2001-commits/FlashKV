@@ -1,0 +1,727 @@
+<title>FlashKV Playground</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+/* Layout: a console on the left, the live keyspace on the right,
+   ordered hot → cold so eviction happens at a visible edge. */
+:root {
+  --paper: #eef1f5;
+  --panel: #ffffff;
+  --ink: #131824;
+  --muted: #5b6577;
+  --rule: #d6dce6;
+  --accent: #2346d8;
+  --accent-soft: #e3e8fd;
+  --ttl: #b86e00;
+  --ttl-soft: #fbefd9;
+  --danger: #c22f3c;
+  --danger-soft: #fbe3e5;
+  --ok: #1d7a4c;
+  --term-bg: #10151f;
+  --term-fg: #d8dfeb;
+  --term-dim: #7d889c;
+  --term-prompt: #8fa7ff;
+  --term-string: #b4e1a4;
+  --term-error: #ff8f98;
+  --type-string: #2346d8;
+  --type-list: #7a3fc0;
+  --type-hash: #00807a;
+  --type-set: #b5501c;
+
+  --font-display: "Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0b0f17;
+    --panel: #131a26;
+    --ink: #e6ebf3;
+    --muted: #94a0b5;
+    --rule: #263042;
+    --accent: #8fa7ff;
+    --accent-soft: #1c2747;
+    --ttl: #f2b14a;
+    --ttl-soft: #36290f;
+    --danger: #ff8f98;
+    --danger-soft: #3a1a20;
+    --ok: #6fd3a0;
+    --term-bg: #070a10;
+    --type-string: #8fa7ff;
+    --type-list: #c49bff;
+    --type-hash: #4fd1c8;
+    --type-set: #ff9e6b;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0b0f17;
+  --panel: #131a26;
+  --ink: #e6ebf3;
+  --muted: #94a0b5;
+  --rule: #263042;
+  --accent: #8fa7ff;
+  --accent-soft: #1c2747;
+  --ttl: #f2b14a;
+  --ttl-soft: #36290f;
+  --danger: #ff8f98;
+  --danger-soft: #3a1a20;
+  --ok: #6fd3a0;
+  --term-bg: #070a10;
+  --type-string: #8fa7ff;
+  --type-list: #c49bff;
+  --type-hash: #4fd1c8;
+  --type-set: #ff9e6b;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.55 var(--font-body);
+  padding-inline: 16px;
+  padding-block: 0 48px;
+}
+.wrap { max-width: 1240px; margin: 0 auto; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Header */
+header.top {
+  display: flex; flex-wrap: wrap; gap: 12px 32px;
+  align-items: end; justify-content: space-between;
+  padding-block: 28px 20px;
+}
+.brand { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.brand h1 {
+  margin: 0;
+  font: 700 clamp(30px, 4vw, 42px)/1 var(--font-display);
+  letter-spacing: -0.02em;
+}
+.brand h1 .bolt { color: var(--accent); }
+.brand p { margin: 0; color: var(--muted); max-width: 62ch; text-wrap: pretty; }
+.facts { display: flex; flex-wrap: wrap; gap: 8px; }
+.fact {
+  font: 500 12px/1 var(--font-mono);
+  padding: 7px 10px; border-radius: 999px;
+  border: 1px solid var(--rule); background: var(--panel); color: var(--muted);
+  white-space: nowrap;
+}
+.fact b { color: var(--ink); font-weight: 600; }
+
+/* Workspace */
+.workspace {
+  display: grid; gap: 16px;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  align-items: start;
+}
+@media (max-width: 900px) { .workspace { grid-template-columns: minmax(0, 1fr); } }
+
+.scenarios { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+.scenarios span { font: 600 11px/1 var(--font-body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-right: 4px; }
+.chip {
+  font: 500 13px/1 var(--font-body);
+  padding: 8px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--rule); background: var(--panel); color: var(--ink);
+  transition: border-color .15s, background .15s;
+}
+.chip:hover { border-color: var(--accent); background: var(--accent-soft); }
+.chip:disabled { opacity: .5; cursor: progress; }
+
+/* Terminal */
+.terminal {
+  background: var(--term-bg); color: var(--term-fg);
+  border-radius: var(--radius);
+  font: 13.5px/1.6 var(--font-mono);
+  display: flex; flex-direction: column;
+  height: min(560px, 70vh); min-height: 380px;
+  overflow: hidden;
+}
+.term-bar {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 10px 14px; border-bottom: 1px solid #ffffff14;
+  color: var(--term-dim); font-size: 12px;
+}
+.term-bar .live::before {
+  content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: #6fd3a0; margin-right: 7px; vertical-align: 1px;
+}
+.term-out { flex: 1; overflow-y: auto; padding: 12px 14px 4px; overflow-wrap: anywhere; }
+.term-out .line { white-space: pre-wrap; }
+.term-out .cmd { color: var(--term-fg); }
+.term-out .prompt { color: var(--term-prompt); }
+.term-out .reply { color: var(--term-string); }
+.term-out .reply.nil { color: var(--term-dim); }
+.term-out .reply.err { color: var(--term-error); }
+.term-out .note { color: var(--term-dim); font-style: italic; }
+.term-in { display: flex; align-items: center; gap: 8px; padding: 8px 14px 12px; }
+.term-in label { color: var(--term-prompt); white-space: nowrap; }
+.term-in input {
+  flex: 1; min-width: 0; background: transparent; border: 0; outline: none;
+  color: var(--term-fg); font: inherit; caret-color: var(--term-prompt);
+}
+.hint { color: var(--muted); font-size: 13px; margin: 8px 2px 0; }
+.hint kbd {
+  font: 500 11px var(--font-mono); padding: 2px 5px; border-radius: 4px;
+  border: 1px solid var(--rule); background: var(--panel);
+}
+
+/* Inspector */
+.inspector {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius);
+  padding: 16px; display: flex; flex-direction: column; gap: 16px; min-width: 0;
+}
+.inspector h2, section h2 {
+  margin: 0; font: 600 13px/1 var(--font-body);
+  letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+}
+.mem-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.mem-value { font: 600 22px/1.1 var(--font-display); font-variant-numeric: tabular-nums; }
+.mem-value small { font: 500 13px var(--font-body); color: var(--muted); }
+.policy {
+  font: 600 11px/1 var(--font-mono); padding: 5px 8px; border-radius: 6px;
+  background: var(--accent-soft); color: var(--accent);
+}
+.gauge { height: 10px; border-radius: 99px; background: var(--paper); overflow: hidden; margin-top: 8px; border: 1px solid var(--rule); }
+.gauge > div { height: 100%; width: 0; background: var(--accent); transition: width .25s ease, background .25s; }
+.gauge.full > div { background: var(--danger); }
+.stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 480px) { .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.stat { display: flex; flex-direction: column; gap: 2px; }
+.stat b { font: 600 18px/1.1 var(--font-display); font-variant-numeric: tabular-nums; }
+.stat span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.stat.warn b { color: var(--danger); }
+.stat.ttl b { color: var(--ttl); }
+
+.lru-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.lru-scale { font: 500 11px var(--font-mono); color: var(--muted); }
+.keys { display: flex; flex-direction: column; gap: 6px; max-height: 420px; overflow-y: auto; padding-right: 2px; }
+.key {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 10px;
+  align-items: center; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--rule); background: var(--panel);
+  font-size: 13px; position: relative; overflow: hidden;
+}
+.key .type {
+  font: 700 10px/1 var(--font-mono); text-transform: uppercase; letter-spacing: .05em;
+  padding: 4px 6px; border-radius: 4px; color: var(--panel); min-width: 48px; text-align: center;
+}
+.type.string { background: var(--type-string); }
+.type.list { background: var(--type-list); }
+.type.hash { background: var(--type-hash); }
+.type.set { background: var(--type-set); }
+.key .name { font: 600 13px var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key .meta { font: 500 11.5px var(--font-mono); color: var(--muted); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.key .preview {
+  grid-column: 2 / 4; font: 12px var(--font-mono); color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.key .ttlbar { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--ttl); transition: width .25s linear; }
+.key .ttl-tag { color: var(--ttl); font-weight: 700; }
+.key.cold { border-style: dashed; }
+.key.gone { background: var(--danger-soft); border-color: var(--danger); animation: fade 1.6s ease forwards; }
+.key.gone.expired { background: var(--ttl-soft); border-color: var(--ttl); }
+.key .gone-tag { font: 700 10px var(--font-mono); text-transform: uppercase; color: var(--danger); }
+.key.gone.expired .gone-tag { color: var(--ttl); }
+@keyframes fade { 0%, 60% { opacity: 1; } 100% { opacity: 0; } }
+.empty { color: var(--muted); font-size: 13px; padding: 16px; text-align: center; border: 1px dashed var(--rule); border-radius: 8px; }
+
+/* Lower sections */
+.lower { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 28px; }
+@media (max-width: 900px) { .lower { grid-template-columns: minmax(0, 1fr); } }
+section.card {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: var(--radius);
+  padding: 18px; display: flex; flex-direction: column; gap: 12px; min-width: 0;
+}
+section.card p { margin: 0; color: var(--muted); max-width: 65ch; }
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 13.5px; }
+th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; font-family: var(--font-mono); }
+th { font: 600 11px var(--font-body); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+td.big { font-weight: 600; }
+.caption { font-size: 12.5px; color: var(--muted); }
+ul.parts { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+ul.parts li { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; font-size: 14px; }
+@media (max-width: 480px) { ul.parts li { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
+ul.parts code { font: 600 12.5px var(--font-mono); color: var(--accent); }
+ul.parts span { color: var(--muted); }
+pre.snippet {
+  margin: 0; background: var(--term-bg); color: var(--term-fg); border-radius: 8px;
+  padding: 12px 14px; font: 12.5px/1.6 var(--font-mono); overflow-x: auto;
+}
+footer { margin-top: 28px; color: var(--muted); font-size: 13px; }
+
+.loading { color: var(--term-dim); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0s !important; transition: none !important; }
+}
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <h1>FlashKV<span class="bolt">⚡</span></h1>
+      <p>A Redis-compatible key-value database written from scratch in C++20. This console runs the real engine, compiled to WebAssembly, right in your browser.</p>
+    </div>
+    <div class="facts" aria-label="Project facts">
+      <span class="fact"><b>C++20</b> → WebAssembly</span>
+      <span class="fact"><b>53</b> Redis commands</span>
+      <span class="fact">RESP2 · AOF · LRU</span>
+      <a class="fact" href="https://github.com/dhyanagni2001-commits/FlashKV" target="_blank" rel="noopener">GitHub ↗</a>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <div>
+      <div class="scenarios" role="group" aria-label="Guided scenarios">
+        <span>Try</span>
+        <button class="chip" data-scenario="strings" type="button">Strings &amp; TTL</button>
+        <button class="chip" data-scenario="lists" type="button">Lists</button>
+        <button class="chip" data-scenario="hashes" type="button">Hashes &amp; sets</button>
+        <button class="chip" data-scenario="lru" type="button">LRU eviction</button>
+        <button class="chip" data-scenario="errors" type="button">Errors</button>
+      </div>
+
+      <div class="terminal">
+        <div class="term-bar">
+          <span class="live" id="engine-status">loading engine…</span>
+          <span>redis-cli compatible</span>
+        </div>
+        <div class="term-out" id="output" aria-live="polite"></div>
+        <form class="term-in" id="console-form" autocomplete="off">
+          <label for="command">127.0.0.1:6379&gt;</label>
+          <input id="command" name="command" spellcheck="false" autocapitalize="off" placeholder="type a command, e.g. SET city Paris EX 20" disabled>
+        </form>
+      </div>
+      <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> history · <kbd>help</kbd> lists commands · <kbd>clear</kbd> wipes the screen</p>
+    </div>
+
+    <aside class="inspector" aria-label="Live keyspace inspector">
+      <div>
+        <div class="mem-head">
+          <h2>Memory</h2>
+          <span class="policy" id="policy">noeviction</span>
+        </div>
+        <div class="mem-head" style="margin-top:8px">
+          <span class="mem-value" id="mem-used">0 B</span>
+          <small class="caption" id="mem-limit">no maxmemory limit</small>
+        </div>
+        <div class="gauge" id="gauge"><div></div></div>
+      </div>
+
+      <div class="stats">
+        <div class="stat"><b id="s-commands">0</b><span>commands</span></div>
+        <div class="stat"><b id="s-hits">0</b><span>hits</span></div>
+        <div class="stat"><b id="s-misses">0</b><span>misses</span></div>
+        <div class="stat ttl"><b id="s-expired">0</b><span>expired</span></div>
+        <div class="stat warn"><b id="s-evicted">0</b><span>evicted</span></div>
+      </div>
+
+      <div>
+        <div class="lru-head">
+          <h2>Keyspace · <span id="key-count">0</span> keys</h2>
+          <span class="lru-scale">most recent ↓ least</span>
+        </div>
+      </div>
+      <div class="keys" id="keys"><div class="empty">Loading the engine…</div></div>
+    </aside>
+  </div>
+
+  <div class="lower">
+    <section class="card">
+      <h2>Inside the server</h2>
+      <ul class="parts">
+        <li><code>poll() event loop</code><span>Non-blocking sockets with per-client input and output buffers, backpressure and pipelining.</span></li>
+        <li><code>RESP2 parser</code><span>Binary-safe and incremental. Commands split across TCP packets are reassembled, and inline commands work for <code>nc</code>.</span></li>
+        <li><code>Expiration</code><span>Lazy on access, plus a Redis-style active cycle that samples volatile keys 10 times a second.</span></li>
+        <li><code>maxmemory</code><span>O(1) LRU list with <code>allkeys-lru</code> or <code>noeviction</code>. Evictions are logged to the AOF as <code>DEL</code>.</span></li>
+        <li><code>Append-only file</code><span>Buffered per event-loop pass, written before replies leave and fsynced every second. Truncated tails are repaired on load.</span></li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Benchmark</h2>
+      <p>flashkv_benchmark against flashkv_server with AOF on: 50 clients, random keys, 16-byte values, on an Apple M5 Pro.</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Command</th><th>ops/sec</th><th>p50 ms</th><th>ops/sec (pipeline 16)</th></tr></thead>
+          <tbody>
+            <tr><td>PING</td><td class="big">253,097</td><td>0.178</td><td>3,271,398</td></tr>
+            <tr><td>SET</td><td class="big">163,791</td><td>0.277</td><td>1,151,968</td></tr>
+            <tr><td>GET</td><td class="big">233,462</td><td>0.202</td><td>2,172,758</td></tr>
+            <tr><td>INCR</td><td class="big">176,575</td><td>0.266</td><td>1,468,557</td></tr>
+            <tr><td>LPUSH</td><td class="big">190,354</td><td>0.253</td><td>1,742,811</td></tr>
+            <tr><td>HSET</td><td class="big">169,376</td><td>0.270</td><td>1,315,925</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="snippet">cmake -S . -B build && cmake --build build
+./build/flashkv_server --maxmemory 100mb --maxmemory-policy allkeys-lru
+redis-cli -p 6379 PING</pre>
+    </section>
+  </div>
+
+  <footer>The demo engine is the same C++ as the server, minus the TCP loop and disk persistence. Data lives in this tab and resets on reload.</footer>
+</div>
+
+<script>/*__FLASHKV_ENGINE__*/</script>
+<script>
+(() => {
+  const output = document.getElementById("output");
+  const input = document.getElementById("command");
+  const form = document.getElementById("console-form");
+  const keysEl = document.getElementById("keys");
+  const chips = [...document.querySelectorAll(".chip")];
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  let execute, tick, stateJson;
+  const history = [];
+  let historyIndex = 0;
+  let busy = false;
+  let previous = { keys: new Map(), expired: 0, evicted: 0 };
+  const ghosts = new Map();
+
+  const COMMANDS = {
+    "Strings": "SET GET MSET MGET INCR DECR INCRBY DECRBY APPEND STRLEN",
+    "Keys": "DEL UNLINK EXISTS TYPE KEYS EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST",
+    "Lists": "LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX",
+    "Hashes": "HSET HGET HDEL HGETALL HLEN HEXISTS HKEYS HVALS",
+    "Sets": "SADD SREM SMEMBERS SISMEMBER SCARD",
+    "Server": "PING ECHO INFO DBSIZE FLUSHALL CONFIG GET|SET MEMORY USAGE SELECT",
+  };
+
+  const SCENARIOS = {
+    strings: [
+      'SET city "Paris" EX 15',
+      "TTL city",
+      "INCRBY page:views 41",
+      "INCR page:views",
+      "SET lock:job-42 worker-1 NX PX 8000",
+      "SET lock:job-42 worker-2 NX",
+      "MGET city page:views missing",
+    ],
+    lists: [
+      "RPUSH jobs:queue resize-image send-email build-report",
+      "LPUSH jobs:queue urgent-fix",
+      "LRANGE jobs:queue 0 -1",
+      "LPOP jobs:queue",
+      "LLEN jobs:queue",
+    ],
+    hashes: [
+      'HSET user:1001 name "Grace Hopper" lang COBOL born 1906',
+      "HGET user:1001 name",
+      "HGETALL user:1001",
+      "SADD skills:grace compilers navy math compilers",
+      "SMEMBERS skills:grace",
+      "SISMEMBER skills:grace navy",
+    ],
+    lru: [
+      "CONFIG SET maxmemory 2kb",
+      "CONFIG SET maxmemory-policy allkeys-lru",
+      // Reading "greeting" every few writes keeps it hot, so LRU
+      // evicts the cold keys around it instead.
+      ...Array.from({ length: 10 }, (_, i) => [
+        `SET cache:page:${i + 1} "${("<div>rendered page " + (i + 1) + "</div>").padEnd(110, ".")}"`,
+        ...(i % 3 === 2 ? ["GET greeting"] : []),
+      ]).flat(),
+      "INFO stats",
+      "CONFIG SET maxmemory 0",
+    ],
+    errors: [
+      "RPUSH demo:list a b",
+      "GET demo:list",
+      "INCR greeting",
+      "SET x",
+      "SET too many args here",
+      "FLY me to the moon",
+    ],
+  };
+
+  const SEED = [
+    'SET greeting "Hello from C++ in your browser"',
+    'HSET user:42 name "Ada Lovelace" role engineer',
+    "RPUSH jobs:queue compile link test",
+    "SADD tags cpp redis wasm",
+    "SET session:abc token-9f2c EX 45",
+  ];
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
+  function appendLine(text, className) {
+    const line = document.createElement("div");
+    line.className = `line ${className}`;
+    line.textContent = text;
+    output.appendChild(line);
+    return line;
+  }
+
+  function echoCommand(command) {
+    const line = document.createElement("div");
+    line.className = "line cmd";
+    const prompt = document.createElement("span");
+    prompt.className = "prompt";
+    prompt.textContent = "127.0.0.1:6379> ";
+    line.append(prompt, command);
+    output.appendChild(line);
+  }
+
+  function scrollToEnd() {
+    output.scrollTop = output.scrollHeight;
+  }
+
+  function run(command, { echo = true } = {}) {
+    const trimmed = command.trim();
+    if (!trimmed) return;
+
+    if (echo) echoCommand(trimmed);
+
+    const lower = trimmed.toLowerCase();
+    if (lower === "clear") {
+      output.textContent = "";
+      return;
+    }
+    if (lower === "help") {
+      for (const [group, names] of Object.entries(COMMANDS)) {
+        appendLine(`${group.padEnd(8)} ${names}`, "note");
+      }
+      scrollToEnd();
+      return;
+    }
+
+    const result = execute(trimmed);
+    if (!result) return;
+    const kind = result[0];
+    const text = result.slice(1);
+    appendLine(text, `reply ${kind === "e" ? "err" : kind === "n" ? "nil" : ""}`);
+    scrollToEnd();
+    render();
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function typeCommand(command) {
+    if (reduceMotion) {
+      run(command);
+      return;
+    }
+    const line = document.createElement("div");
+    line.className = "line cmd";
+    const prompt = document.createElement("span");
+    prompt.className = "prompt";
+    prompt.textContent = "127.0.0.1:6379> ";
+    const typed = document.createTextNode("");
+    line.append(prompt, typed);
+    output.appendChild(line);
+    const step = Math.max(1, Math.ceil(command.length / 28));
+    for (let i = 0; i < command.length; i += step) {
+      typed.data = command.slice(0, i + step);
+      scrollToEnd();
+      await sleep(14);
+    }
+    run(command, { echo: false });
+    await sleep(220);
+  }
+
+  async function playScenario(name) {
+    if (busy) return;
+    busy = true;
+    chips.forEach((chip) => (chip.disabled = true));
+    try {
+      for (const command of SCENARIOS[name]) {
+        await typeCommand(command);
+      }
+    } finally {
+      busy = false;
+      chips.forEach((chip) => (chip.disabled = false));
+      input.focus();
+    }
+  }
+
+  function keyCard(entry, index, total) {
+    const card = document.createElement("div");
+    card.className = "key";
+    if (total > 3 && index === total - 1) card.classList.add("cold");
+
+    const type = document.createElement("span");
+    type.className = `type ${entry.type}`;
+    type.textContent = entry.type;
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = entry.key;
+    name.title = entry.key;
+
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    if (entry.ttlMs >= 0) {
+      const ttl = document.createElement("span");
+      ttl.className = "ttl-tag";
+      ttl.textContent = `${(entry.ttlMs / 1000).toFixed(1)}s · `;
+      meta.appendChild(ttl);
+    }
+    meta.append(`${formatBytes(entry.memory)}`);
+
+    const preview = document.createElement("span");
+    preview.className = "preview";
+    const items = Array.isArray(entry.preview) ? entry.preview : null;
+    if (items) {
+      const more = entry.length > items.length ? ` … +${entry.length - items.length}` : "";
+      const open = entry.type === "list" ? "[" : "{";
+      const close = entry.type === "list" ? "]" : "}";
+      preview.textContent = `${entry.length} · ${open}${items.join(", ")}${more}${close}`;
+    } else {
+      preview.textContent = JSON.stringify(entry.preview);
+    }
+
+    card.append(type, name, meta, preview);
+
+    if (entry.ttlMs >= 0) {
+      const bar = document.createElement("div");
+      bar.className = "ttlbar";
+      bar.style.width = `${Math.max(0, Math.min(100, (entry.ttlMs / entry._ttlStart) * 100))}%`;
+      card.appendChild(bar);
+    }
+    return card;
+  }
+
+  function ghostCard(key, info) {
+    const card = document.createElement("div");
+    card.className = `key gone ${info.reason}`;
+    const type = document.createElement("span");
+    type.className = `type ${info.type}`;
+    type.textContent = info.type;
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = key;
+    const tag = document.createElement("span");
+    tag.className = "gone-tag";
+    tag.textContent = info.reason;
+    card.append(type, name, tag);
+    return card;
+  }
+
+  const ttlStarts = new Map();
+
+  function render() {
+    if (!stateJson) return;
+    const state = JSON.parse(stateJson());
+
+    // Detect keys that disappeared and explain why.
+    const current = new Map(state.keys.map((entry) => [entry.key, entry]));
+    const evictedDelta = state.evictedKeys - previous.evicted;
+    const expiredDelta = state.expiredKeys - previous.expired;
+    for (const [key, entry] of previous.keys) {
+      if (current.has(key) || ghosts.has(key)) continue;
+      let reason = null;
+      if (evictedDelta > 0) reason = "evicted";
+      else if (expiredDelta > 0) reason = "expired";
+      if (reason) ghosts.set(key, { type: entry.type, reason, until: Date.now() + 1600 });
+    }
+    previous = { keys: current, expired: state.expiredKeys, evicted: state.evictedKeys };
+
+    // Remember each key's starting TTL so the bar shows time remaining.
+    for (const entry of state.keys) {
+      if (entry.ttlMs < 0) { ttlStarts.delete(entry.key); continue; }
+      const start = ttlStarts.get(entry.key);
+      if (!start || entry.ttlMs > start) ttlStarts.set(entry.key, entry.ttlMs);
+      entry._ttlStart = ttlStarts.get(entry.key);
+    }
+
+    document.getElementById("mem-used").textContent = formatBytes(state.usedMemory);
+    document.getElementById("mem-limit").textContent = state.maxMemory
+      ? `of ${formatBytes(state.maxMemory)} maxmemory`
+      : "no maxmemory limit";
+    document.getElementById("policy").textContent = state.policy;
+    const gauge = document.getElementById("gauge");
+    const ratio = state.maxMemory ? state.usedMemory / state.maxMemory : Math.min(state.usedMemory / 4096, 1) * 0.35;
+    gauge.firstElementChild.style.width = `${Math.min(ratio, 1) * 100}%`;
+    gauge.classList.toggle("full", state.maxMemory > 0 && ratio >= 0.9);
+
+    document.getElementById("s-commands").textContent = state.commands.toLocaleString();
+    document.getElementById("s-hits").textContent = state.hits.toLocaleString();
+    document.getElementById("s-misses").textContent = state.misses.toLocaleString();
+    document.getElementById("s-expired").textContent = state.expiredKeys.toLocaleString();
+    document.getElementById("s-evicted").textContent = state.evictedKeys.toLocaleString();
+    document.getElementById("key-count").textContent = state.keys.length;
+
+    const fragment = document.createDocumentFragment();
+    state.keys.forEach((entry, index) => fragment.appendChild(keyCard(entry, index, state.keys.length)));
+    const now = Date.now();
+    for (const [key, info] of ghosts) {
+      if (info.until < now) { ghosts.delete(key); continue; }
+      fragment.appendChild(ghostCard(key, info));
+    }
+    if (!fragment.childNodes.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "The keyspace is empty. Try SET hello world.";
+      fragment.appendChild(empty);
+    }
+    keysEl.replaceChildren(fragment);
+  }
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (busy || !execute) return;
+    const command = input.value;
+    if (command.trim()) {
+      history.push(command);
+      historyIndex = history.length;
+    }
+    input.value = "";
+    run(command);
+  });
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowUp" && historyIndex > 0) {
+      historyIndex -= 1;
+      input.value = history[historyIndex];
+      event.preventDefault();
+    } else if (event.key === "ArrowDown") {
+      historyIndex = Math.min(history.length, historyIndex + 1);
+      input.value = history[historyIndex] ?? "";
+      event.preventDefault();
+    }
+  });
+
+  output.addEventListener("click", () => input.focus());
+  chips.forEach((chip) => chip.addEventListener("click", () => playScenario(chip.dataset.scenario)));
+
+  createFlashKV()
+    .then((module) => {
+      execute = module.cwrap("flashkv_execute", "string", ["string"]);
+      tick = module.cwrap("flashkv_tick", "number", []);
+      stateJson = module.cwrap("flashkv_state_json", "string", []);
+
+      document.getElementById("engine-status").textContent = "engine running · WebAssembly";
+      appendLine("# Example data loaded so the inspector has something to show:", "note");
+      SEED.forEach((command) => run(command));
+      appendLine("# Your turn. Type a command, or pick a scenario above.", "note");
+      scrollToEnd();
+
+      input.disabled = false;
+      render();
+
+      // Mirrors the server's 10 Hz background cron.
+      setInterval(() => {
+        tick();
+        render();
+      }, 100);
+    })
+    .catch((error) => {
+      document.getElementById("engine-status").textContent = "engine failed to load";
+      appendLine(`Could not start the WebAssembly engine: ${error}`, "reply err");
+    });
+})();
+</script>

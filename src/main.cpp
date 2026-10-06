@@ -1,29 +1,47 @@
+/*
+ * Interactive local shell: runs the full FlashKV command set
+ * against an in-memory database without a network server.
+ */
+
+#include "commands.hpp"
 #include "database.hpp"
+#include "reply_format.hpp"
+#include "resp.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <iostream>
-#include <sstream>
 #include <string>
 
 int main() {
     Database database;
+    CommandProcessor processor(database);
+
+    std::cout << "FlashKV " << FLASHKV_VERSION << " local shell\n";
+    std::cout << "Type Redis commands (SET, GET, LPUSH, HSET, ...). "
+                 "EXIT or QUIT to leave.\n";
+
     std::string input;
 
-    std::cout << "FlashKV server started\n";
-    std::cout << "Enter SET, GET, DEL, EXISTS, or EXIT\n";
-
     while (true) {
-        std::cout << "flashkv> ";
+        std::cout << "flashkv> " << std::flush;
 
         if (!std::getline(std::cin, input)) {
             break;
         }
 
-        std::istringstream stream(input);
-        std::string command;
+        auto arguments = tokenizeCommandLine(input);
 
-        stream >> command;
+        if (!arguments.has_value()) {
+            std::cout << "Invalid argument(s): unbalanced quotes\n";
+            continue;
+        }
+
+        if (arguments->empty()) {
+            continue;
+        }
+
+        std::string command = (*arguments)[0];
 
         std::transform(
             command.begin(),
@@ -34,46 +52,15 @@ int main() {
             }
         );
 
-        if (command == "SET") {
-            std::string key;
-            std::string value;
-
-            stream >> key;
-            std::getline(stream >> std::ws, value);
-
-            if (key.empty() || value.empty()) {
-                std::cout << "Usage: SET key value\n";
-                continue;
-            }
-
-            database.set(key, value);
-            std::cout << "OK\n";
-        } else if (command == "GET") {
-            std::string key;
-            stream >> key;
-
-            auto value = database.get(key);
-
-            if (value.has_value()) {
-                std::cout << value.value() << '\n';
-            } else {
-                std::cout << "(nil)\n";
-            }
-        } else if (command == "DEL") {
-            std::string key;
-            stream >> key;
-
-            std::cout << (database.del(key) ? 1 : 0) << '\n';
-        } else if (command == "EXISTS") {
-            std::string key;
-            stream >> key;
-
-            std::cout << (database.exists(key) ? 1 : 0) << '\n';
-        } else if (command == "EXIT") {
+        if (command == "EXIT" || command == "QUIT") {
             break;
-        } else if (!command.empty()) {
-            std::cout << "Unknown command\n";
         }
+
+        // Expired keys are also reclaimed in the background.
+        database.activeExpireCycle();
+
+        CommandReply reply = processor.execute(*arguments);
+        std::cout << formatReply(reply.payload, command == "INFO") << '\n';
     }
 
     std::cout << "FlashKV stopped\n";
