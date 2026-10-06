@@ -1,5 +1,7 @@
 # FlashKV
 
+**[▶ Live demo](https://dhyanagni2001-commits.github.io/FlashKV/)**: try the real engine in your browser, compiled to WebAssembly.
+
 FlashKV is a lightweight, Redis-compatible, in-memory key-value database built from scratch in C++20.
 
 The project explores database internals, non-blocking TCP networking, the Redis Serialization Protocol (RESP2), expiration, persistence and memory eviction. It works with `redis-cli` and other Redis clients, and the same engine also compiles to WebAssembly for an in-browser playground.
@@ -279,7 +281,7 @@ Replaying the resulting 244 MB AOF (about 5.8 million commands, 200k keys) took 
 open web/dist/index.html
 ```
 
-The `Demo` workflow publishes the playground to GitHub Pages on every push to `main`. Enable it under **Settings → Pages → Source: GitHub Actions**.
+The live demo is hosted on GitHub Pages at https://dhyanagni2001-commits.github.io/FlashKV/. The `Demo` workflow rebuilds it and updates the `gh-pages` branch on every push to `main`.
 
 ## Current Limitations
 
